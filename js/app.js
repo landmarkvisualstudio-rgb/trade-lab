@@ -1,4 +1,4 @@
-import { ASSETS, GROUPS, STRATEGIES, DEFAULT_SETTINGS, BAR_MS, WARMUP_BARS, assetBySymbol } from './config.js';
+import { ASSETS, GROUPS, STRATEGIES, FAMILIES, DEFAULT_SETTINGS, BAR_MS, WARMUP_BARS, assetBySymbol } from './config.js';
 import { runSimulation, closeAllAtEnd, computeStats, signalStats, BLOCK_REASONS } from './engine.js';
 import { ensureHistory, klines, tickers, liveStream, pool, unavailable, netState, toSeries, mode, probe } from './data.js';
 import { createCandleChart, createAreaChart, priceDecimals, sparkPath } from './chart.js';
@@ -14,12 +14,12 @@ setDemoStorage(mode.demo);
 const S = {
   settings: mergeSettings(load('settings', {})),
   theme: load('theme', 'auto'),
-  live: load('live', { status: 'idle' }),      // {status, start, end, settings}
-  liveRes: null, liveStats: null, liveLoading: null, liveError: '',
+  tests: [], res: {}, seen: load('seen2', {}), view: null, focus: null, draft: null,
+  liveLoading: null, liveError: '',
   prices: {}, t24: {}, sparks: {},
   page: ['dash', 'market', 'trades', 'backtest', 'settings'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'dash', detail: null, tf: '15m',
   bt: { res: load('bt', null), running: null, days: load('btDays', 7), error: '' },
-  filter: 'all', search: '', tradesTab: 'closed', tradesSrc: 'live',
+  filter: 'all', search: '', tradesTab: 'closed', tradesSrc: null,
   installEvt: null, seenEvents: load('seenEvents', 0), offline: false,
 };
 const charts = [];
@@ -112,7 +112,7 @@ function renderNav() {
     <div class="brand"><span class="brand-mark">${I.logo}</span><div>ترید لب<small>آزمایشگاه معامله‌ی مجازی</small></div></div>
     ${NAV.map(([k, n]) => `<button data-go="${k}" class="${S.page === k ? 'active' : ''}" aria-label="${n}">${I[k]}<span>${n}</span></button>`).join('')}
     <div class="nav-foot">همه‌ی معاملات با پول مجازی است.<br>داده: Binance (اسپات و فیوچرز)</div>`;
-  $('#nav').querySelectorAll('[data-go]').forEach(b => b.onclick = () => go(b.dataset.go));
+  $('#nav').querySelectorAll('[data-go]').forEach(b => b.onclick = () => { if (b.dataset.go === 'dash') S.view = null; go(b.dataset.go); });
 }
 
 function topbar(title) {
@@ -178,8 +178,8 @@ function verdictCard(st, bench) {
   return `<div class="card glass"><div class="verdict ${kind}"><div class="badge">${icon}</div><div><b>${title}</b><p>${text}</p></div></div></div>`;
 }
 
-function breakdown(st) {
-  const rows = Object.entries(STRATEGIES).map(([k, s]) => ({ k, name: s.name, ...(st.bySetup[k] || { n: 0, wins: 0, pnl: 0 }) }));
+function breakdown(st, enabled) {
+  const rows = Object.entries(STRATEGIES).filter(([k]) => !enabled || enabled.includes(k) || st.bySetup[k]).map(([k, s]) => ({ k, name: s.name, ...(st.bySetup[k] || { n: 0, wins: 0, pnl: 0 }) }));
   const max = Math.max(1, ...rows.map(r => Math.abs(r.pnl)));
   const bars = rows.map(r => {
     const w = Math.abs(r.pnl) / max * 50;
@@ -203,9 +203,9 @@ function blockedCard(res) {
     <p class="muted" style="font-size:12px;margin:10px 0 0">کل سیگنال‌های اسکنر: ${res.signals}. هر سیگنال اول از فیلتر trader-risk و trader-budget رد می‌شود و بعد وارد معامله می‌شود.</p></details>`;
 }
 
-function tradeRow(x, live = false) {
+function tradeRow(x, live = false, res = null) {
   const a = assetBySymbol[x.symbol];
-  const px = live ? (S.prices[x.symbol] ?? S.liveRes?.lastClose[x.symbol] ?? x.entry) : x.exit;
+  const px = live ? (S.prices[x.symbol] ?? res?.lastClose[x.symbol] ?? x.entry) : x.exit;
   const pnl = live ? (px - x.entry) * x.qty * x.dir - x.entryFee : x.pnl;
   const R = pnl / x.riskUSDT;
   const side = x.dir > 0 ? '<span class="tag up">خرید</span>' : '<span class="tag down">فروش</span>';
@@ -224,37 +224,94 @@ function benchmark(res, data) {
   return (s.c[i1] / s.o[i0] - 1) * 100;
 }
 
-/* ---------------- live test ---------------- */
-let liveData = null, refreshing = false, lastRefreshBar = 0;
+/* ---------------- tests (several at once) ---------------- */
+// Each test has its own budget, duration, profile, setups and assets, and they all
+// run side by side on the same real candles. Every test is deterministic: the same
+// start time and settings give the same trades, on any device.
+const DEFAULT_WARMUP = 300;      // bars before the start, so slow averages (EMA 200) are ready
+const newId = () => 't' + Date.now().toString(36) + Math.floor(Math.random() * 46656).toString(36);
+function loadTests() {
+  const T = load('tests', null);
+  if (Array.isArray(T)) return T;
+  // first run of this version: the single test of the old version becomes test 1
+  const out = [];
+  const old = load('live', null);
+  if (old && old.start && (old.status === 'running' || old.status === 'done')) {
+    const id = newId();
+    out.push({ id, name: 'تست ۱', status: old.status, start: old.start, end: old.end, settings: old.settings, warmup: 200 });
+    const seen = load('seenEvents', 0); save('seen2', { [id]: seen });
+    const snap = load('liveSnap', null); if (snap) save('snap:' + id, snap);
+  }
+  save('tests', out);
+  return out;
+}
+const saveTests = () => save('tests', S.tests);
+const testById = id => S.tests.find(t => t.id === id);
+const testSymbols = t => ASSETS.map(a => a.symbol).filter(s => t.settings.symbols[s] && !unavailable.has(s));
+const testStrats = t => Object.keys(STRATEGIES).filter(k => t.settings.strategies[k]);
+const testDays = t => t.settings.testDays ?? (t.end - t.start) / DAY;
+const nowBarT = () => Math.floor(Date.now() / BAR_MS) * BAR_MS;
+function focusTest() {
+  return testById(S.view) || testById(S.focus) || S.tests.find(t => t.status === 'running') || S.tests[S.tests.length - 1] || null;
+}
 
-async function refreshLive(force = false) {
-  const L = S.live;
-  if (!L || (L.status !== 'running' && L.status !== 'done') || refreshing) return;
-  const nowBar = Math.floor(Date.now() / BAR_MS) * BAR_MS;
-  if (!force && nowBar === lastRefreshBar && S.liveRes) return;
+function sliceSeries(s, from, to) {
+  let a = 0, b = s.t.length;
+  while (a < s.t.length && s.t[a] < from) a++;
+  while (b > a && s.t[b - 1] >= to) b--;
+  return { t: s.t.slice(a, b), o: s.o.slice(a, b), h: s.h.slice(a, b), l: s.l.slice(a, b), c: s.c.slice(a, b), v: s.v.slice(a, b) };
+}
+
+let refreshing = false, lastRefreshBar = 0;
+async function refreshTests(force = false) {
+  const nowBar = nowBarT();
+  const todo = S.tests.filter(t => !(S.res[t.id]?.final));
+  if (!todo.length || refreshing) return;
+  if (!force && nowBar === lastRefreshBar && todo.every(t => S.res[t.id])) return;
   refreshing = true;
-  const to = Math.min(nowBar, L.end);
-  const from = L.start - WARMUP_BARS * BAR_MS;
-  const syms = ASSETS.map(a => a.symbol).filter(s => L.settings.symbols[s] && !unavailable.has(s));
+  // one download per asset for all tests: from the earliest start that needs it
+  const need = {};
+  let to = 0;
+  for (const t of todo) {
+    const from = t.start - (t.warmup || 200) * BAR_MS;
+    to = Math.max(to, Math.min(nowBar, t.end));
+    for (const s of testSymbols(t)) need[s] = Math.min(need[s] ?? Infinity, from);
+  }
+  const syms = Object.keys(need);
   S.liveLoading = { done: 0, total: syms.length };
   updateLoading();
+  let toasts = 0;
   try {
-    const data = {};
+    const full = {};
     await pool(syms, 4, async s => {
-      try { data[s] = await ensureHistory(s, from, to); } catch { /* unavailable */ }
+      try { full[s] = await ensureHistory(s, need[s], to); } catch { /* unavailable */ }
       S.liveLoading.done++; updateLoading();
     });
-    if (!Object.keys(data).length) throw new Error('no data');
-    let res = runSimulation({ data, settings: L.settings, start: L.start, end: Math.min(to, L.end), capital: L.settings.capital });
-    if (Date.now() >= L.end && res.lastTime >= L.end - BAR_MS * 2) {
-      res = closeAllAtEnd(res, L.settings);
-      if (L.status !== 'done') { L.status = 'done'; save('live', L); toast('تست یک‌هفته‌ای تمام شد. نتیجه‌ی نهایی آماده است.'); notify('ترید لب', 'تست تمام شد. نتیجه‌ی نهایی آماده است.'); }
+    if (!Object.keys(full).length) throw new Error('no data');
+    for (const t of todo) {
+      const from = t.start - (t.warmup || 200) * BAR_MS, tt = Math.min(nowBar, t.end);
+      const data = {};
+      for (const s of testSymbols(t)) if (full[s]) data[s] = sliceSeries(full[s], from, tt);
+      if (!Object.keys(data).length) continue;
+      if (Date.now() < t.start) { S.res[t.id] = null; continue; }
+      let res = runSimulation({ data, settings: t.settings, start: t.start, end: Math.min(tt, t.end), capital: t.settings.capital });
+      if (Date.now() >= t.end && res.lastTime >= t.end - BAR_MS * 2) {
+        res = closeAllAtEnd(res, t.settings); res.final = true;
+        if (t.status !== 'done') {
+          t.status = 'done'; saveTests();
+          const st = computeStats(res);
+          toast(`«${esc(t.name)}» تمام شد: ${signed(st.pnl)} USDT`); notify('ترید لب', `${t.name} تمام شد. نتیجه: ${signed(st.pnl)} USDT`);
+        }
+      }
+      res.bench = benchmark(res, data);
+      res.targetR = t.settings.targetR;
+      S.res[t.id] = res;
+      toasts += announce(t, res, toasts);
+      save('snap:' + t.id, { at: Date.now(), stats: computeStats(res), equity: thin(res.equity, 160) });
+      await new Promise(r => setTimeout(r, 0)); // keep the page responsive between tests
     }
-    liveData = data;
-    S.liveRes = res; S.liveError = '';
+    S.liveError = '';
     lastRefreshBar = nowBar;
-    announce(res);
-    save('liveSnap', { at: Date.now(), stats: computeStats(res), equity: thin(res.equity, 300) });
   } catch (e) {
     S.liveError = 'دریافت داده از Binance ممکن نشد. اتصال اینترنت یا VPN را بررسی کنید.'; S.offline = true;
   } finally {
@@ -263,43 +320,127 @@ async function refreshLive(force = false) {
   }
 }
 
-function announce(res) {
+function announce(t, res, already) {
   const ev = res.events.filter(e => e.type === 'entry' || e.type === 'exit');
-  if (ev.length < S.seenEvents) S.seenEvents = 0;
-  const fresh = ev.slice(S.seenEvents);
-  S.seenEvents = ev.length; save('seenEvents', S.seenEvents);
-  if (fresh.length > 8) { toast(`${fresh.length} رویداد جدید از آخرین بازدید ثبت شد`); return; }
-  for (const e of fresh.slice(-3)) {
-    const n = assetBySymbol[e.symbol]?.name || e.symbol;
-    if (e.type === 'entry') { const m = `ورود ${e.dir > 0 ? 'خرید' : 'فروش'} ${n} · ${STRATEGIES[e.setup]?.name}`; toast(m); notify('معامله‌ی جدید', m); }
-    else { const m = `خروج ${n} (${REASON[e.reason]}): ${signed(e.pnl)} USDT`; toast(m, e.pnl >= 0 ? 'up' : 'down'); notify('معامله بسته شد', m); }
+  const seen = S.seen[t.id] ?? 0;
+  const fresh = ev.slice(ev.length < seen ? 0 : seen);
+  S.seen[t.id] = ev.length; save('seen2', S.seen);
+  if (!fresh.length || already >= 3) return 0;
+  const tag = S.tests.length > 1 ? `<b>${esc(t.name)}</b> · ` : '';
+  if (fresh.length > 6) { toast(`${tag}${fresh.length} رویداد جدید از آخرین بازدید`); return 1; }
+  let n = 0;
+  for (const e of fresh.slice(-2)) {
+    const nm = assetBySymbol[e.symbol]?.name || e.symbol;
+    if (e.type === 'entry') { const m = `ورود ${e.dir > 0 ? 'خرید' : 'فروش'} ${nm} · ${STRATEGIES[e.setup]?.name}`; toast(tag + m); notify(t.name, m); }
+    else { const m = `خروج ${nm} (${REASON[e.reason]}): ${signed(e.pnl)} USDT`; toast(tag + m, e.pnl >= 0 ? 'up' : 'down'); notify(t.name, m); }
+    n++;
   }
+  return n;
 }
 
 function thin(arr, n) { if (arr.length <= n) return arr; const step = arr.length / n; const out = []; for (let k = 0; k < n; k++) out.push(arr[Math.floor(k * step)]); out.push(arr[arr.length - 1]); return out; }
 
 function updateLoading() {
-  const el = $('#liveLoading');
-  if (el) el.innerHTML = S.liveLoading ? `<span class="loader"></span> دریافت داده‌ی بازار ${S.liveLoading.done}/${S.liveLoading.total}` : '';
+  document.querySelectorAll('.liveLoading').forEach(el => {
+    el.innerHTML = S.liveLoading ? `<span class="loader"></span> دریافت داده‌ی بازار ${S.liveLoading.done}/${S.liveLoading.total}` : '';
+  });
 }
 
-function startLive() {
+/* new-test form: a draft that turns into a test */
+const STRAT_SETS = {
+  all: ['همه‌ی ستاپ‌ها', () => Object.keys(STRATEGIES)],
+  trader: ['مهارت‌های تریدر', () => Object.keys(STRATEGIES).filter(k => STRATEGIES[k].src === 'trader')],
+  chart: ['تحلیل‌گر چارت', () => Object.keys(STRATEGIES).filter(k => STRATEGIES[k].src === 'chart')],
+  settings: ['طبق تنظیمات', () => Object.keys(STRATEGIES).filter(k => S.settings.strategies[k])],
+};
+const ASSET_SETS = {
+  all: ['همه', () => ASSETS.map(a => a.symbol)],
+  crypto: ['رمزارزهای اصلی', () => ASSETS.filter(a => a.group === 'crypto').map(a => a.symbol)],
+  meme: ['میم‌کوین‌ها', () => ASSETS.filter(a => a.group === 'meme').map(a => a.symbol)],
+  commod: ['طلا، نقره، مس و انرژی', () => ASSETS.filter(a => a.group === 'metal' || a.group === 'energy').map(a => a.symbol)],
+  settings: ['طبق تنظیمات', () => ASSETS.filter(a => S.settings.symbols[a.symbol]).map(a => a.symbol)],
+};
+function freshDraft() {
+  const prof = activeProfile(S.settings);
+  return { name: `تست ${faNum(S.tests.length + 1)}`, capital: S.settings.capital, days: S.settings.testDays, profile: prof === 'custom' ? 'custom' : prof, strat: 'all', assets: 'all' };
+}
+const faNum = n => String(n).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
+function draftSettings(dr) {
+  const st = JSON.parse(JSON.stringify(S.settings));
+  if (dr.profile !== 'custom' && PROFILES[dr.profile]) Object.assign(st, PROFILES[dr.profile].set);
+  st.capital = Math.max(10, +dr.capital || 1000);
+  st.testDays = dr.days;
+  const ks = new Set(STRAT_SETS[dr.strat][1]());
+  st.strategies = Object.fromEntries(Object.keys(STRATEGIES).map(k => [k, ks.has(k)]));
+  const ss = new Set(ASSET_SETS[dr.assets][1]());
+  st.symbols = Object.fromEntries(ASSETS.map(a => [a.symbol, ss.has(a.symbol)]));
+  return st;
+}
+function newTestForm(dr) {
+  const chips = (list, cur, attr) => list.map(([k, n]) => `<button class="chip ${cur === k ? 'active' : ''}" data-${attr}="${k}">${n}</button>`).join('');
+  return `<div class="ntf">
+    <div class="ntf-row"><label class="ntf-f"><span>نام تست</span><input class="input" id="ntName" maxlength="40" value="${esc(dr.name)}"></label>
+    <label class="ntf-f"><span>بودجه (USDT)</span><input class="input num" id="ntCap" type="number" inputmode="decimal" min="10" step="10" value="${dr.capital}"></label></div>
+    <div class="pick"><div class="pick-l">مدت</div><div class="chips">${chips(DURATIONS.map(([d, n]) => [String(d), n]), String(dr.days), 'ndur')}</div></div>
+    <div class="pick"><div class="pick-l">پروفایل</div><div class="chips">${chips([...Object.entries(PROFILES).map(([k, p]) => [k, p.name]), ['custom', 'طبق تنظیمات']], dr.profile, 'nprof')}</div></div>
+    <div class="pick"><div class="pick-l">ستاپ‌ها</div><div class="chips">${chips(Object.entries(STRAT_SETS).map(([k, v]) => [k, v[0]]), dr.strat, 'nstrat')}</div></div>
+    <div class="pick"><div class="pick-l">دارایی‌ها</div><div class="chips">${chips(Object.entries(ASSET_SETS).map(([k, v]) => [k, v[0]]), dr.assets, 'nasset')}</div></div>
+    <div class="muted ntf-sum">${draftSummary(dr)}</div>
+  </div>`;
+}
+function draftSummary(dr) {
+  const st = draftSettings(dr);
+  const nS = Object.values(st.strategies).filter(Boolean).length, nA = Object.values(st.symbols).filter(Boolean).length;
+  return `${nS} ستاپ روی ${nA} دارایی · ${dr.profile === 'custom' ? 'تنظیمات دستی' : PROFILES[dr.profile].desc} · ریسک هر معامله ${nf(st.capital * st.riskPct / 100)} تتر`;
+}
+function bindNewTestForm(root, dr, rerender) {
+  root.querySelector('#ntName').oninput = e => { dr.name = e.target.value; };
+  root.querySelector('#ntCap').oninput = e => { dr.capital = Math.max(10, +e.target.value || 1000); const s = root.querySelector('.ntf-sum'); if (s) s.innerHTML = draftSummary(dr); };
+  root.querySelectorAll('[data-ndur]').forEach(b => b.onclick = () => { dr.days = +b.dataset.ndur; rerender(); });
+  root.querySelectorAll('[data-nprof]').forEach(b => b.onclick = () => { dr.profile = b.dataset.nprof; rerender(); });
+  root.querySelectorAll('[data-nstrat]').forEach(b => b.onclick = () => { dr.strat = b.dataset.nstrat; rerender(); });
+  root.querySelectorAll('[data-nasset]').forEach(b => b.onclick = () => { dr.assets = b.dataset.nasset; rerender(); });
+}
+function startTest(dr) {
+  const settings = draftSettings(dr);
+  if (!Object.values(settings.strategies).some(Boolean)) return toast('هیچ ستاپی انتخاب نشده');
+  if (!Object.values(settings.symbols).some(Boolean)) return toast('هیچ دارایی‌ای انتخاب نشده');
   const start = Math.ceil(Date.now() / BAR_MS) * BAR_MS;
-  S.live = { status: 'running', start, end: start + S.settings.testDays * DAY, settings: JSON.parse(JSON.stringify(S.settings)) };
-  save('live', S.live); S.seenEvents = 0; save('seenEvents', 0);
-  S.liveRes = null; lastRefreshBar = 0;
-  toast(`تست ${durLabel(S.settings.testDays)} شروع شد. ربات از کندل ۵ دقیقه‌ای بعدی معامله می‌کند.`);
+  const t = { id: newId(), name: (dr.name || '').trim() || `تست ${faNum(S.tests.length + 1)}`, status: 'running', start, end: start + dr.days * DAY, settings, warmup: DEFAULT_WARMUP };
+  S.tests.push(t); saveTests();
+  S.seen[t.id] = 0; save('seen2', S.seen);
+  S.focus = t.id;
+  toast(`«${esc(t.name)}» با ${nf(settings.capital, 0)} تتر شروع شد. ربات از کندل ۵ دقیقه‌ای بعدی معامله می‌کند.`);
   if (S.settings.notifications && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission();
-  render(); refreshLive(true);
+  S.draft = null;
+  render(); refreshTests(true);
 }
-async function stopLive() {
-  if (!(await confirmBox('تست الان تمام شود؟ پوزیشن‌های باز با آخرین قیمت بسته می‌شوند.', 'پایان تست'))) return;
-  S.live.end = Math.floor(Date.now() / BAR_MS) * BAR_MS;
-  save('live', S.live); refreshLive(true);
+function showNewTest() {
+  const dr = freshDraft();
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-wrap';
+  const draw = () => {
+    wrap.innerHTML = `<div class="modal glass ntf-modal" role="dialog" aria-modal="true"><p style="margin-bottom:10px">تست تازه</p>${newTestForm(dr)}
+      <div class="acts" style="margin-top:14px"><button class="btn primary" data-ok>${I.play} شروع</button><button class="btn" data-no>انصراف</button></div></div>`;
+    bindNewTestForm(wrap, dr, draw);
+    wrap.querySelector('[data-ok]').onclick = () => { wrap.remove(); startTest(dr); };
+    wrap.querySelector('[data-no]').onclick = () => wrap.remove();
+  };
+  wrap.addEventListener('click', e => { if (e.target === wrap) wrap.remove(); });
+  draw();
+  document.body.appendChild(wrap);
 }
-async function resetLive() {
-  if (S.live.status === 'running' && !(await confirmBox('نتیجه‌ی تست فعلی پاک شود و تست تازه شروع شود؟', 'شروع دوباره'))) return;
-  S.live = { status: 'idle' }; save('live', S.live); remove('liveSnap'); S.liveRes = null; render();
+async function stopTest(t) {
+  if (!(await confirmBox(`«${t.name}» الان تمام شود؟ پوزیشن‌های باز با آخرین قیمت بسته می‌شوند.`, 'پایان تست'))) return;
+  t.end = Math.max(t.start + BAR_MS, nowBarT());
+  saveTests(); delete S.res[t.id]; refreshTests(true);
+}
+async function deleteTest(t) {
+  if (!(await confirmBox(`«${t.name}» و همه‌ی نتیجه‌هایش از این دستگاه پاک شود؟`, 'حذف تست'))) return;
+  S.tests = S.tests.filter(x => x.id !== t.id); saveTests();
+  delete S.res[t.id]; remove('snap:' + t.id); delete S.seen[t.id]; save('seen2', S.seen);
+  if (S.view === t.id) S.view = null;
+  render();
 }
 function confirmBox(msg, okText = 'تأیید') {
   return new Promise(resolve => {
@@ -330,39 +471,61 @@ function applyProfile(k) { Object.assign(S.settings, PROFILES[k].set); save('set
 
 /* ---------------- device sync ---------------- */
 // The robot is deterministic: the same start time and settings give the same
-// trades on any device. A sync link carries just those.
+// trades on any device. A sync link carries just those, for every test.
+// Setups and assets go as bit lists in a fixed order (new ones are only ever
+// appended), so a test keeps exactly its own set on the other device.
+const STRAT_KEYS = Object.keys(STRATEGIES), SYM_KEYS = ASSETS.map(a => a.symbol);
+const LEGACY_STRATS = 5, LEGACY_SYMS = 17; // what version 1 links knew about
+const toBits = arr => { let s = ''; for (let i = 0; i < arr.length; i += 4) s += (arr.slice(i, i + 4).reduce((a, b, k) => a | (b ? 1 << k : 0), 0)).toString(16); return s; };
+const fromBits = (s, n) => Array.from({ length: n }, (_, i) => !!((parseInt(s[i >> 2] || '0', 16) >> (i & 3)) & 1));
 function settingsDiff(st) {
   const d = {};
   for (const [k, v] of Object.entries(st)) {
-    if (k === 'strategies' || k === 'symbols') {
-      const sub = {}; for (const [kk, vv] of Object.entries(v)) if (DEFAULT_SETTINGS[k][kk] !== vv) sub[kk] = vv;
-      if (Object.keys(sub).length) d[k] = sub;
-    } else if (DEFAULT_SETTINGS[k] !== v) d[k] = v;
+    if (k === 'strategies' || k === 'symbols') continue;
+    if (DEFAULT_SETTINGS[k] !== v) d[k] = v;
   }
+  d.sk = toBits(STRAT_KEYS.map(k => !!st.strategies[k]));
+  d.sy = toBits(SYM_KEYS.map(s => !!st.symbols[s]));
   return d;
+}
+function settingsFromDiff(d, legacy) {
+  const { sk, sy, strategies, symbols, ...rest } = d || {};
+  const st = { ...DEFAULT_SETTINGS, ...rest };
+  if (legacy) { // version 1: a diff against the old defaults (5 setups, 17 assets on)
+    st.strategies = Object.fromEntries(STRAT_KEYS.map((k, i) => [k, i < LEGACY_STRATS ? (strategies?.[k] ?? true) : false]));
+    st.symbols = Object.fromEntries(SYM_KEYS.map((s, i) => [s, i < LEGACY_SYMS ? (symbols?.[s] ?? true) : false]));
+  } else {
+    const a = fromBits(sk || '', STRAT_KEYS.length), b = fromBits(sy || '', SYM_KEYS.length);
+    st.strategies = Object.fromEntries(STRAT_KEYS.map((k, i) => [k, a[i]]));
+    st.symbols = Object.fromEntries(SYM_KEYS.map((s, i) => [s, b[i]]));
+  }
+  return st;
 }
 const b64u = str => btoa(unescape(encodeURIComponent(str))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const unb64u = str => decodeURIComponent(escape(atob(str.replace(/-/g, '+').replace(/_/g, '/'))));
 function syncLink() {
-  const L = S.live;
-  const payload = { v: 1, s: L.start, e: L.end, d: settingsDiff(L.settings), m: mode.demo ? 1 : 0 };
+  const payload = { v: 2, m: mode.demo ? 1 : 0, t: S.tests.map(t => ({ n: t.name, s: t.start, e: t.end, w: t.warmup || 200, d: settingsDiff(t.settings) })) };
   return location.origin + location.pathname + '#join=' + b64u(JSON.stringify(payload));
 }
 async function handleJoin() {
   const m = location.hash.match(/^#join=([\w-]+)/);
   if (!m) return false;
   history.replaceState(null, '', location.pathname + '#dash');
-  S.page = 'dash'; S.detail = null;
+  S.page = 'dash'; S.detail = null; S.view = null;
   let p;
   try { p = JSON.parse(unb64u(m[1])); } catch { toast('لینک همگام‌سازی معتبر نیست'); return false; }
   if (!!p.m !== mode.demo) { save('demo', !!p.m); save('pendingJoin', m[1]); location.reload(); return true; }
-  const settings = mergeSettings(p.d || {});
-  const same = S.live && S.live.start === p.s && S.live.end === p.e;
-  if (!same && S.live.status !== 'idle' && !(await confirmBox('روی این دستگاه یک تست دیگر هست. با تست دستگاه دیگر جایگزین شود؟', 'جایگزین کن'))) return false;
-  S.live = { status: Date.now() >= p.e ? 'done' : 'running', start: p.s, end: p.e, settings };
-  save('live', S.live); S.seenEvents = 0; save('seenEvents', 0); S.liveRes = null; lastRefreshBar = 0;
-  toast('همگام شد: همان تست دستگاه دیگر روی این دستگاه باز است.');
-  render(); refreshLive(true);
+  const list = p.v === 2 ? p.t || [] : [{ n: 'تست ۱', s: p.s, e: p.e, w: 200, d: p.d, legacy: true }];
+  let added = 0;
+  for (const x of list) {
+    if (!x || !x.s || !x.e) continue;
+    if (S.tests.some(t => t.start === x.s && t.end === x.e && t.name === x.n)) continue;
+    const t = { id: newId(), name: x.n || `تست ${faNum(S.tests.length + 1)}`, status: Date.now() >= x.e ? 'done' : 'running', start: x.s, end: x.e, settings: settingsFromDiff(x.d, x.legacy), warmup: x.w || 200 };
+    S.tests.push(t); S.seen[t.id] = 0; added++;
+  }
+  saveTests(); save('seen2', S.seen);
+  toast(added ? `همگام شد: ${added} تست از دستگاه دیگر اضافه شد.` : 'همه‌ی تست‌های آن دستگاه از قبل اینجا هستند.');
+  render(); refreshTests(true);
   return true;
 }
 let qrLib = null;
@@ -377,7 +540,7 @@ async function showSync() {
   wrap.className = 'modal-wrap';
   wrap.innerHTML = `<div class="modal glass sync-modal" role="dialog" aria-modal="true">
     <p style="margin-bottom:8px">همگام‌سازی با دستگاه دیگر</p>
-    <div class="muted" style="font-size:13px;line-height:1.9;margin-bottom:12px">این کد را با دوربین گوشی اسکن کنید یا لینک را روی دستگاه دیگر باز کنید. همان تست با همان زمان شروع و همان تنظیمات آنجا باز می‌شود و چون ربات از روی کندل‌های واقعی حساب می‌کند، معامله‌ها روی هر دو دستگاه یکی است.</div>
+    <div class="muted" style="font-size:13px;line-height:1.9;margin-bottom:12px">این کد را با دوربین گوشی اسکن کنید یا لینک را روی دستگاه دیگر باز کنید. همه‌ی تست‌ها با همان زمان شروع و همان تنظیمات آنجا باز می‌شوند و چون ربات از روی کندل‌های واقعی حساب می‌کند، معامله‌ها روی هر دو دستگاه یکی است.</div>
     <div class="qr" id="qrBox"><span class="loader"></span></div>
     <input class="input sync-link" readonly value="${esc(link)}" id="syncLink">
     <div class="acts" style="margin-top:12px"><button class="btn primary" data-copy>کپی لینک</button><button class="btn" data-close>بستن</button></div></div>`;
@@ -397,12 +560,12 @@ async function showSync() {
 }
 
 /* ---------------- signal accuracy ---------------- */
-function accuracyCard(res) {
+function accuracyCard(res, enabled) {
   if (!res?.sigEval) return '';
   const ss = signalStats(res.sigEval);
   const T = ss.total;
   const be = 100 / (1 + (res.targetR || S.settings.targetR));
-  const rows = Object.entries(STRATEGIES).map(([k, st]) => {
+  const rows = Object.entries(STRATEGIES).filter(([k]) => !enabled || enabled.includes(k) || ss.bySetup[k]).map(([k, st]) => {
     const b = ss.bySetup[k];
     if (!b || !b.n) return `<div class="bar-row"><div><b style="font-weight:600">${st.name}</b><div class="muted" style="font-size:11.5px">بدون سیگنال</div></div><div class="bar-track"></div><div class="num muted" style="min-width:70px;text-align:left">—</div></div>`;
     const acc = b.accuracy, good = acc >= be;
@@ -431,105 +594,214 @@ function offlineCard() {
     <div class="hero-actions" style="margin:0"><button class="btn sm" data-retry>${I.refresh} تلاش دوباره</button><button class="btn sm primary" data-demo-on>${I.play} حالت نمایشی</button></div></div>`;
 }
 
-/* ---------------- page: dashboard ---------------- */
+/* ---------------- page: dashboard (all tests) ---------------- */
+function howItWorks() {
+  return `<div class="card glass">
+    <h3>چطور کار می‌کند</h3>
+    <div class="list">
+      ${[['۱', 'چند تست هم‌زمان', 'هر تست بودجه، مدت، پروفایل، ستاپ‌ها و دارایی‌های خودش را دارد؛ همه در یک پنل کنار هم'], ['۲', 'اسکنر', `${Object.keys(STRATEGIES).length} ستاپ (مهارت‌های تریدر و تحلیل‌گر چارت) روی کندل‌های ۵ دقیقه‌ای ${ASSETS.length} دارایی`], ['۳', 'ورود و خروج', 'فقط بعد از بسته شدن کندل؛ حد ضرر قبل از ورود، هدف بر حسب R و سقف زمان نگه‌داری'], ['۴', 'بودجه و ریسک', 'ریسک هر معامله درصدی از همان بودجه‌ی تست، حد ضرر روزانه و سقف پوزیشن باز'], ['۵', 'کارمزد واقعی', `کارمزد ${S.settings.feeSpotPct}% و لغزش ${S.settings.slippagePct}% در هر معامله کم می‌شود`], ['۶', 'همگام‌سازی', 'با دکمه‌ی «همگام‌سازی» همه‌ی تست‌ها روی گوشی یا لپ‌تاپ دیگر هم باز می‌شوند']]
+        .map(([n, a, b]) => `<div class="row"><span class="coin" style="background:linear-gradient(145deg,#2c4fb0,#0a1838)">${n}</span><div class="main"><div class="t1">${a}</div><div class="t2" style="white-space:normal">${b}</div></div></div>`).join('')}
+    </div>
+    <p class="note" style="margin:12px 0 0">اگر اپ را ببندید ربات متوقف نمی‌شود: با باز کردن دوباره، کندل‌های جاافتاده از Binance گرفته و دقیقاً همان معامله‌ها بازسازی می‌شوند.</p>
+  </div>`;
+}
+
+function testStatsOf(t) {
+  const res = S.res[t.id];
+  if (res) return { st: computeStats(res, S.prices), res };
+  const snap = load('snap:' + t.id, null);
+  return { st: snap?.stats || null, res: null, snap };
+}
+function statusTag(t) {
+  const now = Date.now();
+  if (t.status === 'done') return '<span class="status done"><span class="dot"></span> تمام شد</span>';
+  if (now < t.start) return '<span class="status run"><span class="dot"></span> منتظر اولین کندل</span>';
+  return '<span class="status run"><span class="dot"></span> در حال معامله</span>';
+}
+const profName = st => PROFILES[activeProfile(st)]?.name || 'سفارشی';
+const progOf = t => Math.min(100, Math.max(0, (Math.min(Date.now(), t.end) - t.start) / (t.end - t.start) * 100));
+function miniSpark(eq, base) {
+  if (!eq || eq.length < 2) return '<div class="tc-spark"></div>';
+  const vals = eq.map(x => x[1]);
+  const up = vals[vals.length - 1] >= base;
+  return `<svg class="tc-spark" viewBox="0 0 120 34" preserveAspectRatio="none"><path d="${sparkPath(vals, 120, 34)}" fill="none" stroke="var(--${up ? 'up' : 'down'})" stroke-width="1.7" stroke-linejoin="round"/></svg>`;
+}
+
+function testCard(t) {
+  const { st, res, snap } = testStatsOf(t);
+  const cap = t.settings.capital;
+  const acc = res?.sigEval ? signalStats(res.sigEval).total : null;
+  const eq = res ? thin(res.equity, 120) : snap?.equity;
+  return `<div class="card glass test-card click" data-test="${t.id}">
+    <div class="tc-head"><b>${esc(t.name)}</b>${statusTag(t)}</div>
+    <div class="tc-meta">${durLabel(testDays(t))} · ${profName(t.settings)} · ${testStrats(t).length} ستاپ · ${testSymbols(t).length} دارایی</div>
+    <div class="tc-eq num" data-teq="${t.id}">${st ? nf(st.equity) : '<span class="skeleton">1,000.00</span>'}<small>USDT</small></div>
+    <div class="pnl-row" data-tpnl="${t.id}">${st ? pnlPills(st, cap) : ''}</div>
+    ${miniSpark(eq, cap)}
+    <div class="tc-stats">
+      <div><span>بودجه</span><b class="num">${nf(cap, 0)}</b></div>
+      <div><span>بسته / باز</span><b class="num">${st ? `${st.n} / ${st.openCount}` : '—'}</b></div>
+      <div><span>نرخ برد</span><b class="num">${st && st.n ? nf(st.winRate, 0) + '%' : '—'}</b></div>
+      <div><span>درستی</span><b class="num">${acc && acc.done ? nf(acc.accuracy, 0) + '%' : '—'}</b></div>
+    </div>
+    <div class="progress"><div style="width:${progOf(t)}%"></div></div>
+    <div class="progress-meta"><span>${fdt(t.start)}</span><span>${t.status === 'done' ? 'پایان: ' + fdt(t.end) : 'باقی‌مانده: ' + dur(t.end - Date.now())}</span></div>
+  </div>`;
+}
+
+function compareCard() {
+  if (S.tests.length < 2) return '';
+  const rows = S.tests.map(t => { const { st } = testStatsOf(t); return { t, ret: st ? st.pnl / t.settings.capital * 100 : null, st }; });
+  const max = Math.max(0.5, ...rows.map(r => Math.abs(r.ret || 0)));
+  const bars = rows.sort((a, b) => (b.ret ?? -1e9) - (a.ret ?? -1e9)).map(({ t, ret, st }) => {
+    const w = Math.abs(ret || 0) / max * 50;
+    const side = (ret || 0) >= 0 ? `left:${50 - w}%;right:50%` : `right:${50 - w}%;left:50%`;
+    return `<div class="bar-row click" data-test="${t.id}"><div><b style="font-weight:600">${esc(t.name)}</b><div class="muted" style="font-size:11.5px">${durLabel(testDays(t))} · ${profName(t.settings)} · ${st ? st.n : 0} معامله</div></div>
+      <div class="bar-track"><span class="mid"></span>${ret == null ? '' : `<div style="${side};background:var(--${ret >= 0 ? 'up' : 'down'})"></div>`}</div>
+      <div class="num ${cls(ret)}" style="font-weight:700;min-width:70px;text-align:left">${ret == null ? '—' : signed(ret) + '%'}</div></div>`;
+  }).join('');
+  return `<div class="card glass span-2"><h3>مقایسه‌ی تست‌ها <span class="muted">بازده نسبت به بودجه‌ی هر تست</span></h3><div class="bars">${bars}</div></div>`;
+}
+
 function pageDash(main) {
-  const L = S.live;
-  if (L.status === 'idle') {
+  if (S.view && testById(S.view)) return pageTest(main, testById(S.view));
+  S.view = null;
+  if (!S.tests.length) {
+    const dr = S.draft || (S.draft = freshDraft());
     main.innerHTML = `<div class="page">${topbar('داشبورد')}${offlineCard()}
       <div class="dash-grid">
         <div class="card glass hero">
           <div class="hero-top"><span class="status"><span class="dot"></span> آماده‌ی شروع</span></div>
-          <div class="label" style="margin-top:14px">سرمایه‌ی مجازی</div>
-          <div class="equity num">${nf(S.settings.capital, 0)}<small>USDT</small></div>
-          <p class="muted" style="margin:6px 0 0;max-width:560px">ربات با پول مجازی و روی قیمت واقعی بازار، به‌صورت خودکار معامله می‌کند: اسکنر ستاپ پیدا می‌کند، برنامه‌ی خروج حد ضرر و هدف را می‌گذارد، مدیر بودجه حجم را تعیین می‌کند و مدیر ریسک معامله‌های پرخطر را رد می‌کند. بعد از ${durLabel(S.settings.testDays)} معلوم می‌شود این سیستم چقدر سود یا ضرر داده است.</p>
-          <div class="pick"><div class="pick-l">مدت تست</div><div class="chips">${DURATIONS.map(([d, n]) => `<button class="chip ${Math.abs(S.settings.testDays - d) < 1e-6 ? 'active' : ''}" data-dur="${d}">${n}</button>`).join('')}</div></div>
-          <div class="pick"><div class="pick-l">پروفایل</div><div class="chips">${Object.entries(PROFILES).map(([k, pr]) => `<button class="chip ${activeProfile(S.settings) === k ? 'active' : ''}" data-prof="${k}">${pr.name}</button>`).join('')}${activeProfile(S.settings) === 'custom' ? '<button class="chip active">سفارشی</button>' : ''}</div></div>
-          <div class="muted" style="font-size:12.5px;margin-top:6px">${activeProfile(S.settings) === 'custom' ? 'تنظیمات دستی از صفحه‌ی تنظیمات' : PROFILES[activeProfile(S.settings)].desc}</div>
+          <div class="label" style="margin-top:14px">اولین تست</div>
+          <p class="muted" style="margin:6px 0 10px;max-width:560px">ربات با پول مجازی و روی قیمت واقعی بازار، خودکار معامله می‌کند. می‌توانید چند تست هم‌زمان بسازید (مثلاً یکی ۴ ساعته و یکی ۱ روزه) و همه را در یک پنل مقایسه کنید.</p>
+          <div id="ntBox">${newTestForm(dr)}</div>
           <div class="hero-actions">
-            <button class="btn primary" id="startBtn">${I.play} شروع تست ${durLabel(S.settings.testDays)}</button>
+            <button class="btn primary" id="startBtn">${I.play} شروع تست</button>
             <button class="btn" data-go2="backtest">${I.backtest} اول یک بک‌تست سریع</button>
           </div>
         </div>
-        <div class="card glass">
-          <h3>چطور کار می‌کند</h3>
-          <div class="list">
-            ${[['۱', 'اسکنر', '۵ ستاپ روی کندل‌های ۵ دقیقه‌ای ۱۷ دارایی'], ['۲', 'ورود', 'فقط بعد از بسته شدن کندل؛ با قیمت باز کندل بعد'], ['۳', 'خروج', `حد ضرر قبل از ورود، هدف ${S.settings.targetR}R، حداکثر ${S.settings.maxHoldHours} ساعت`], ['۴', 'بودجه و ریسک', `ریسک هر معامله ${S.settings.riskPct}% و حد ضرر روزانه ${S.settings.dailyLossPct}%`], ['۵', 'کارمزد واقعی', `کارمزد ${S.settings.feeSpotPct}% و لغزش ${S.settings.slippagePct}% در هر معامله کم می‌شود`], ['۶', 'همگام‌سازی', 'بعد از شروع، با دکمه‌ی «همگام‌سازی» همان تست را روی گوشی یا لپ‌تاپ دیگر باز کنید']]
-              .map(([n, a, b]) => `<div class="row"><span class="coin" style="background:linear-gradient(145deg,#2c4fb0,#0a1838)">${n}</span><div class="main"><div class="t1">${a}</div><div class="t2" style="white-space:normal">${b}</div></div></div>`).join('')}
-          </div>
-          <p class="note" style="margin:12px 0 0">اگر اپ را ببندید ربات متوقف نمی‌شود: با باز کردن دوباره، کندل‌های جاافتاده از Binance گرفته و دقیقاً همان معامله‌ها بازسازی می‌شوند.</p>
-        </div>
+        ${howItWorks()}
       </div></div>`;
-    $('#startBtn').onclick = startLive;
-    main.querySelectorAll('[data-dur]').forEach(b => b.onclick = () => { S.settings.testDays = +b.dataset.dur; save('settings', S.settings); render(); });
-    main.querySelectorAll('[data-prof]').forEach(b => b.onclick = () => { applyProfile(b.dataset.prof); render(); });
+    const box = $('#ntBox');
+    const redraw = () => { box.innerHTML = newTestForm(dr); bindNewTestForm(box, dr, redraw); };
+    bindNewTestForm(box, dr, redraw);
+    $('#startBtn').onclick = () => startTest(dr);
     main.querySelector('[data-go2]').onclick = () => go('backtest');
     return;
   }
 
-  const res = S.liveRes;
-  const snap = !res ? load('liveSnap', null) : null;
-  const st = res ? computeStats(res, S.prices) : snap?.stats;
-  const now = Date.now();
-  const done = L.status === 'done';
-  const prog = Math.min(100, Math.max(0, (Math.min(now, L.end) - L.start) / (L.end - L.start) * 100));
-  const statusHtml = done ? '<span class="status done"><span class="dot"></span> تست تمام شد</span>'
-    : now < L.start ? '<span class="status run"><span class="dot"></span> منتظر اولین کندل</span>'
-    : '<span class="status run"><span class="dot"></span> ربات در حال معامله</span>';
-  const bench = res && liveData ? benchmark(res, liveData) : null;
-
+  // totals over every test
+  let cap = 0, eq = 0, n = 0, wins = 0, open = 0, have = 0;
+  for (const t of S.tests) {
+    const { st } = testStatsOf(t);
+    cap += t.settings.capital;
+    if (st) { have++; eq += st.equity; n += st.n; wins += st.wins; open += st.openCount; } else eq += t.settings.capital;
+  }
+  const pnl = eq - cap;
+  const running = S.tests.filter(t => t.status === 'running').length;
   main.innerHTML = `<div class="page">${topbar('داشبورد')}${offlineCard()}
     ${S.liveError ? `<div class="note warn" style="margin-bottom:12px">${S.liveError}</div>` : ''}
     <div class="dash-grid">
-      <div class="card glass hero">
-        <div class="hero-top">${statusHtml}<span class="muted" id="liveLoading" style="font-size:12.5px"></span></div>
-        <div class="label" style="margin-top:14px">ارزش حساب مجازی</div>
-        <div class="equity num" id="eqVal">${st ? nf(st.equity) : '<span class="skeleton">1,000.00</span>'}<small>USDT</small></div>
-        <div class="pnl-row" id="pnlRow">${st ? pnlPills(st, L.settings.capital) : ''}</div>
-        <div class="subrow"><span>سود قطعی: <b class="num ${cls(st?.realized)}">${st ? signed(st.realized) : '—'}</b></span><span>سود شناور: <b class="num ${cls(st?.unrealized)}" id="unrealVal">${st ? signed(st.unrealized) : '—'}</b></span><span>سرمایه‌ی اولیه: <b class="num">${nf(L.settings.capital, 0)}</b></span></div>
-        <div class="progress"><div style="width:${prog}%"></div></div>
-        <div class="progress-meta"><span>${jD.format(new Date(L.start))} · ${durLabel(L.settings.testDays)}</span><span>${done ? 'پایان: ' + jD.format(new Date(L.end)) : 'باقی‌مانده: ' + dur(L.end - now)}</span></div>
+      <div class="card glass hero span-2">
+        <div class="hero-top"><span class="status ${running ? 'run' : 'done'}"><span class="dot"></span> ${running ? `${faNum(running)} تست در حال معامله` : 'همه‌ی تست‌ها تمام شده'}${S.tests.length - running ? ` · ${faNum(S.tests.length - running)} تمام‌شده` : ''}</span><span class="muted liveLoading" style="font-size:12.5px"></span></div>
+        <div class="label" style="margin-top:14px">ارزش کل همه‌ی تست‌ها</div>
+        <div class="equity num" id="totEq">${nf(eq)}<small>USDT</small></div>
+        <div class="pnl-row" id="totPnl"><span class="pill ${pnl >= 0 ? 'up' : 'down'} num">${signed(pnl)} USDT</span><span class="pill ${pnl >= 0 ? 'up' : 'down'} num">${signed(pnl / cap * 100)}%</span></div>
+        <div class="subrow"><span>بودجه‌ی کل: <b class="num">${nf(cap, 0)}</b></span><span>معاملات بسته / باز: <b class="num">${n} / ${open}</b></span><span>نرخ برد کل: <b class="num">${n ? nf(wins / n * 100, 1) + '%' : '—'}</b></span></div>
         <div class="hero-actions">
+          <button class="btn sm primary" id="newTestBtn">${I.play} تست جدید</button>
           <button class="btn sm" id="refreshBtn">${I.refresh} به‌روزرسانی</button>
           <button class="btn sm" id="syncBtn">${I.install} همگام‌سازی دستگاه‌ها</button>
-          ${done ? `<button class="btn sm primary" id="newBtn">${I.play} تست تازه</button>` : `<button class="btn sm danger" id="stopBtn">${I.stop} پایان زودهنگام</button>`}
-          ${done ? '' : `<button class="btn sm" id="resetBtn">شروع دوباره</button>`}
         </div>
       </div>
-      ${st ? verdictCard(st, bench) : '<div class="card glass"><div class="empty"><span class="loader"></span><br>در حال ساخت نتیجه از کندل‌های بازار…</div></div>'}
-      <div class="span-2">${st ? kpiTiles(st, { k: 'سیگنال اسکنر', v: res?.signals ?? '—', s: `${durLabel(L.settings.testDays)} · ${PROFILES[activeProfile(L.settings)]?.name || 'سفارشی'}`, R: L.settings.targetR }) : ''}</div>
-      ${res ? `<div class="span-2">${accuracyCard({ ...res, targetR: L.settings.targetR })}</div>` : ''}
+      ${compareCard()}
+      <div class="span-2 tests-grid">${S.tests.slice().reverse().map(testCard).join('')}</div>
+    </div></div>`;
+  $('#newTestBtn').onclick = showNewTest;
+  $('#refreshBtn').onclick = () => refreshTests(true);
+  $('#syncBtn').onclick = showSync;
+  main.querySelectorAll('[data-test]').forEach(c => c.onclick = () => { S.view = c.dataset.test; S.focus = S.view; render(); window.scrollTo({ top: 0 }); });
+  updateLoading();
+}
+
+/* one test, in full */
+function pageTest(main, t) {
+  const L = t;
+  const { st, res, snap } = testStatsOf(t);
+  const now = Date.now();
+  const done = L.status === 'done';
+  const enabled = testStrats(t);
+  main.innerHTML = `<div class="page">${topbar('داشبورد')}${offlineCard()}
+    <button class="back" id="backBtn">${I.back} همه‌ی تست‌ها</button>
+    ${S.liveError ? `<div class="note warn" style="margin-bottom:12px">${S.liveError}</div>` : ''}
+    <div class="dash-grid">
+      <div class="card glass hero">
+        <div class="hero-top">${statusTag(t)}<span class="muted liveLoading" style="font-size:12.5px"></span></div>
+        <div class="label" style="margin-top:14px">${esc(t.name)} · ارزش حساب مجازی</div>
+        <div class="equity num" id="eqVal">${st ? nf(st.equity) : '<span class="skeleton">1,000.00</span>'}<small>USDT</small></div>
+        <div class="pnl-row" id="pnlRow">${st ? pnlPills(st, L.settings.capital) : ''}</div>
+        <div class="subrow"><span>سود قطعی: <b class="num ${cls(st?.realized)}">${st ? signed(st.realized) : '—'}</b></span><span>سود شناور: <b class="num ${cls(st?.unrealized)}" id="unrealVal">${st ? signed(st.unrealized) : '—'}</b></span><span>بودجه: <b class="num">${nf(L.settings.capital, 0)}</b></span></div>
+        <div class="progress"><div style="width:${progOf(t)}%"></div></div>
+        <div class="progress-meta"><span>${fdt(L.start)} · ${durLabel(testDays(t))}</span><span>${done ? 'پایان: ' + fdt(L.end) : 'باقی‌مانده: ' + dur(L.end - now)}</span></div>
+        <div class="hero-actions">
+          <button class="btn sm" id="refreshBtn">${I.refresh} به‌روزرسانی</button>
+          <button class="btn sm" id="syncBtn">${I.install} همگام‌سازی</button>
+          ${done ? '' : `<button class="btn sm danger" id="stopBtn">${I.stop} پایان زودهنگام</button>`}
+          <button class="btn sm" id="delBtn">حذف تست</button>
+        </div>
+      </div>
+      ${st ? verdictCard(st, res?.bench, L.settings.targetR) : `<div class="card glass"><div class="empty">${now < t.start ? 'تست از کندل ۵ دقیقه‌ای بعدی شروع می‌شود…' : '<span class="loader"></span><br>در حال ساخت نتیجه از کندل‌های بازار…'}</div></div>`}
+      <div class="span-2">${st ? kpiTiles(st, { k: 'سیگنال اسکنر', v: res?.signals ?? '—', s: `${durLabel(testDays(t))} · ${profName(L.settings)}`, R: L.settings.targetR }) : ''}</div>
+      <div class="card glass span-2"><h3>تنظیمات این تست</h3><div class="tc-cfg">
+        <span>پروفایل: <b>${profName(L.settings)}</b></span><span>ریسک هر معامله: <b class="num">${L.settings.riskPct}%</b></span><span>هدف: <b class="num">${L.settings.targetR}R</b></span><span>نگه‌داری: <b class="num">${L.settings.maxHoldHours}</b> ساعت</span><span>پوزیشن هم‌زمان: <b class="num">${L.settings.maxOpen}</b></span><span>شورت: <b>${L.settings.allowShort ? 'روشن' : 'خاموش'}</b></span></div>
+        <div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.9">ستاپ‌ها: ${enabled.map(k => STRATEGIES[k].name).join('، ')}<br>دارایی‌ها: ${testSymbols(t).map(s => assetBySymbol[s]?.short || s).join('، ')}</div></div>
+      ${res ? `<div class="span-2">${accuracyCard(res, enabled)}</div>` : ''}
       <div class="card glass span-2"><h3>منحنی سرمایه <span class="muted">هر نقطه = بسته شدن یک کندل ۵ دقیقه‌ای</span></h3><div class="chart-box" id="eqChart"></div></div>
-      <div class="card glass"><h3>پوزیشن‌های باز <span class="muted">قیمت زنده</span></h3><div class="list" id="openList">${openList()}</div></div>
-      <div class="card glass"><h3>آخرین معاملات <span class="muted"><a href="#trades">همه</a></span></h3><div class="list">${res && res.closed.length ? res.closed.slice(-6).reverse().map(x => tradeRow(x)).join('') : '<div class="empty">هنوز معامله‌ای بسته نشده</div>'}</div></div>
-      ${st && st.n ? `<div class="span-2 grid cols-2">${breakdown(st)}</div>` : ''}
+      <div class="card glass"><h3>پوزیشن‌های باز <span class="muted">قیمت زنده</span></h3><div class="list" id="openList">${openList(res)}</div></div>
+      <div class="card glass"><h3>آخرین معاملات <span class="muted"><a href="#trades" id="allTrades">همه</a></span></h3><div class="list">${res && res.closed.length ? res.closed.slice(-6).reverse().map(x => tradeRow(x, false, res)).join('') : '<div class="empty">هنوز معامله‌ای بسته نشده</div>'}</div></div>
+      ${st && st.n ? `<div class="span-2 grid cols-2">${breakdown(st, enabled)}</div>` : ''}
       ${res ? `<div class="span-2">${blockedCard(res)}</div>` : ''}
     </div></div>`;
   const eq = createAreaChart($('#eqChart'), { base: L.settings.capital, emptyText: 'منحنی سرمایه بعد از اولین کندل‌ها رسم می‌شود' });
   charts.push(eq);
   eq.setData(res ? thin(res.equity, 600).concat(res.equity.length ? [[Date.now(), st.equity]] : []) : snap?.equity || [], L.settings.capital);
-  $('#refreshBtn').onclick = () => refreshLive(true);
+  $('#backBtn').onclick = () => { S.view = null; render(); window.scrollTo({ top: 0 }); };
+  $('#refreshBtn').onclick = () => refreshTests(true);
   $('#syncBtn').onclick = showSync;
-  $('#stopBtn') && ($('#stopBtn').onclick = stopLive);
-  $('#resetBtn') && ($('#resetBtn').onclick = resetLive);
-  $('#newBtn') && ($('#newBtn').onclick = () => { S.live = { status: 'idle' }; save('live', S.live); render(); });
+  $('#stopBtn') && ($('#stopBtn').onclick = () => stopTest(t));
+  $('#delBtn').onclick = () => deleteTest(t);
+  $('#allTrades').onclick = e => { e.preventDefault(); S.tradesSrc = t.id; go('trades'); };
   main.querySelectorAll('.row[data-sym]').forEach(r => r.onclick = () => openDetail(r.dataset.sym));
   updateLoading();
 }
 const pnlPills = (st, cap) => `<span class="pill ${st.pnl >= 0 ? 'up' : 'down'} num">${signed(st.pnl)} USDT</span><span class="pill ${st.pnl >= 0 ? 'up' : 'down'} num">${signed(st.pnl / cap * 100)}%</span>`;
-function openList() {
-  const res = S.liveRes;
+function openList(res) {
   if (!res || !res.open.length) return '<div class="empty">پوزیشن بازی نیست</div>';
-  return res.open.map(x => tradeRow(x, true)).join('');
+  return res.open.map(x => tradeRow(x, true, res)).join('');
 }
 
 // light refresh on price ticks
 function onPrices() {
-  if (S.page === 'dash' && S.liveRes && !S.detail) {
-    const st = computeStats(S.liveRes, S.prices);
-    const e = $('#eqVal'); if (e) e.innerHTML = `${nf(st.equity)}<small>USDT</small>`;
-    const p = $('#pnlRow'); if (p) p.innerHTML = pnlPills(st, S.live.settings.capital);
-    const u = $('#unrealVal'); if (u) { u.textContent = signed(st.unrealized); u.className = 'num ' + cls(st.unrealized); }
-    const o = $('#openList'); if (o) { o.innerHTML = openList(); o.querySelectorAll('.row[data-sym]').forEach(r => r.onclick = () => openDetail(r.dataset.sym)); }
+  if (S.page === 'dash' && !S.detail) {
+    const t = S.view && testById(S.view);
+    if (t && S.res[t.id]) {
+      const res = S.res[t.id];
+      const st = computeStats(res, S.prices);
+      const e = $('#eqVal'); if (e) e.innerHTML = `${nf(st.equity)}<small>USDT</small>`;
+      const p = $('#pnlRow'); if (p) p.innerHTML = pnlPills(st, t.settings.capital);
+      const u = $('#unrealVal'); if (u) { u.textContent = signed(st.unrealized); u.className = 'num ' + cls(st.unrealized); }
+      const o = $('#openList'); if (o) { o.innerHTML = openList(res); o.querySelectorAll('.row[data-sym]').forEach(r => r.onclick = () => openDetail(r.dataset.sym)); }
+    } else if (!t) {
+      let cap = 0, eq = 0;
+      for (const x of S.tests) {
+        const { st } = testStatsOf(x); cap += x.settings.capital; eq += st ? st.equity : x.settings.capital;
+        if (!st) continue;
+        const e = document.querySelector(`[data-teq="${x.id}"]`); if (e) e.innerHTML = `${nf(st.equity)}<small>USDT</small>`;
+        const p = document.querySelector(`[data-tpnl="${x.id}"]`); if (p) p.innerHTML = pnlPills(st, x.settings.capital);
+      }
+      const te = $('#totEq'); if (te) te.innerHTML = `${nf(eq)}<small>USDT</small>`;
+      const tp = $('#totPnl'); if (tp && cap) { const pnl = eq - cap; tp.innerHTML = `<span class="pill ${pnl >= 0 ? 'up' : 'down'} num">${signed(pnl)} USDT</span><span class="pill ${pnl >= 0 ? 'up' : 'down'} num">${signed(pnl / cap * 100)}%</span>`; }
+    }
   }
   document.querySelectorAll('[data-price]').forEach(el => { const s = el.dataset.price; if (S.prices[s] != null) el.textContent = fp(S.prices[s]); });
   document.querySelectorAll('[data-chg]').forEach(el => {
@@ -586,7 +858,8 @@ let detailTimer = null;
 function pageDetail(main, sym) {
   const a = assetBySymbol[sym];
   const t = S.t24[sym];
-  const res = S.liveRes;
+  const ft = focusTest();
+  const res = ft ? S.res[ft.id] : null;
   const mine = res ? res.closed.filter(x => x.symbol === sym) : [];
   const openPos = res ? res.open.find(x => x.symbol === sym) : null;
   main.innerHTML = `<div class="page">${topbar('بازار')}
@@ -608,7 +881,7 @@ function pageDetail(main, sym) {
     <div class="sep"></div>
     <div class="grid cols-2">
       <div class="card glass" id="tmCard"><h3>ماشین زمان <span class="muted">trader-timemachine</span></h3><div class="empty"><span class="loader"></span></div></div>
-      <div class="card glass"><h3>معاملات ربات روی ${esc(a.name)}</h3><div class="list">${openPos ? tradeRow(openPos, true) : ''}${mine.slice(-8).reverse().map(x => tradeRow(x)).join('') || (openPos ? '' : '<div class="empty">ربات هنوز روی این نماد معامله نکرده</div>')}</div></div>
+      <div class="card glass"><h3>معاملات ربات روی ${esc(a.name)}${ft && S.tests.length > 1 ? ` <span class="muted">${esc(ft.name)}</span>` : ''}</h3><div class="list">${openPos ? tradeRow(openPos, true, res) : ''}${mine.slice(-8).reverse().map(x => tradeRow(x)).join('') || (openPos ? '' : '<div class="empty">ربات هنوز روی این نماد معامله نکرده</div>')}</div></div>
     </div></div>`;
   $('#backBtn').onclick = () => { S.detail = null; render(); };
   const ch = createCandleChart($('#candles'), { emptyText: 'در حال دریافت نمودار…' });
@@ -671,22 +944,27 @@ async function timeMachinePanel(sym) {
 
 /* ---------------- page: trades ---------------- */
 function pageTrades(main) {
-  const res = S.tradesSrc === 'live' ? S.liveRes : S.bt.res;
+  const srcs = [...S.tests.slice().reverse().map(x => [x.id, x.name]), ['bt', 'بک‌تست']];
+  if (!srcs.some(([k]) => k === S.tradesSrc)) S.tradesSrc = focusTest()?.id || 'bt';
+  const isBt = S.tradesSrc === 'bt';
+  const res = isBt ? S.bt.res : S.res[S.tradesSrc];
   const closed = res ? [...res.closed].reverse() : [];
-  const openT = S.tradesSrc === 'live' && res ? res.open : [];
+  const openT = !isBt && res ? res.open : [];
   main.innerHTML = `<div class="page">${topbar('معاملات')}
     <div class="toolbar">
-      <div class="seg">${[['live', 'تست زنده'], ['bt', 'بک‌تست']].map(([k, n]) => `<button data-src="${k}" class="${S.tradesSrc === k ? 'active' : ''}">${n}</button>`).join('')}</div>
+      <div class="chips src-chips">${srcs.map(([k, n]) => `<button data-src="${k}" class="chip ${S.tradesSrc === k ? 'active' : ''}">${esc(n)}</button>`).join('')}</div>
+    </div>
+    <div class="toolbar">
       <div class="seg">${[['closed', `بسته (${closed.length})`], ['open', `باز (${openT.length})`]].map(([k, n]) => `<button data-tab="${k}" class="${S.tradesTab === k ? 'active' : ''}">${n}</button>`).join('')}</div>
       <div style="flex:1"></div>
       <button class="btn sm" id="csvBtn" ${closed.length ? '' : 'disabled'}>${I.download} خروجی CSV</button>
     </div>
     <div class="card glass"><div class="list">
-      ${S.tradesTab === 'open' ? (openT.map(x => tradeRow(x, true)).join('') || '<div class="empty">پوزیشن بازی نیست</div>')
-        : (closed.slice(0, 300).map(x => tradeRow(x)).join('') || `<div class="empty">${res ? 'هنوز معامله‌ای بسته نشده' : S.tradesSrc === 'live' ? 'تست زنده هنوز شروع نشده' : 'هنوز بک‌تستی اجرا نشده'}</div>`)}
+      ${S.tradesTab === 'open' ? (openT.map(x => tradeRow(x, true, res)).join('') || '<div class="empty">پوزیشن بازی نیست</div>')
+        : (closed.slice(0, 300).map(x => tradeRow(x)).join('') || `<div class="empty">${res ? 'هنوز معامله‌ای بسته نشده' : isBt ? 'هنوز بک‌تستی اجرا نشده' : S.tests.length ? 'در حال ساخت نتیجه…' : 'هنوز تستی شروع نشده'}</div>`)}
       ${closed.length > 300 && S.tradesTab === 'closed' ? `<div class="empty">${closed.length - 300} معامله‌ی قدیمی‌تر در فایل CSV هست</div>` : ''}
     </div></div></div>`;
-  main.querySelectorAll('[data-src]').forEach(b => b.onclick = () => { S.tradesSrc = b.dataset.src; render(); });
+  main.querySelectorAll('[data-src]').forEach(b => b.onclick = () => { S.tradesSrc = b.dataset.src; if (b.dataset.src !== 'bt') S.focus = b.dataset.src; render(); });
   main.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { S.tradesTab = b.dataset.tab; render(); });
   main.querySelectorAll('.row[data-sym]').forEach(r => r.onclick = () => openDetail(r.dataset.sym));
   $('#csvBtn').onclick = () => exportCSV(closed);
@@ -695,7 +973,7 @@ function exportCSV(trades) {
   const head = ['id', 'symbol', 'setup', 'side', 'entry_time', 'entry', 'stop', 'target', 'qty', 'notional_usdt', 'risk_usdt', 'exit_time', 'exit', 'reason', 'fees_usdt', 'pnl_usdt', 'R'];
   const lines = [head.join(',')].concat(trades.map(x => [x.id, x.symbol, x.setup, x.dir > 0 ? 'long' : 'short', new Date(x.entryTime).toISOString(), x.entry, x.stop, x.target, x.qty, x.notional.toFixed(2), x.riskUSDT.toFixed(2), new Date(x.exitTime).toISOString(), x.exit, x.reason, x.fees.toFixed(4), x.pnl.toFixed(4), x.R.toFixed(3)].join(',')));
   const blob = new Blob(['\ufeff' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
-  const filename = `trade-lab-${S.tradesSrc}-${new Date().toISOString().slice(0, 10)}.csv`;
+  const filename = `trade-lab-${S.tradesSrc === 'bt' ? 'backtest' : 'test-' + (S.tests.findIndex(x => x.id === S.tradesSrc) + 1)}-${new Date().toISOString().slice(0, 10)}.csv`;
   if (window.claude?.use) { // inside claude.ai the viewer offers the file
     window.claude.use('downloads').then(dl => {
       if (!dl) return toast('دانلود فایل در این صفحه در دسترس نیست');
@@ -703,7 +981,7 @@ function exportCSV(trades) {
     });
     return;
   }
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `trade-lab-${S.tradesSrc}-${new Date().toISOString().slice(0, 10)}.csv`; a.click();
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
@@ -778,11 +1056,11 @@ async function runBacktest() {
 /* ---------------- page: settings ---------------- */
 function pageSettings(main) {
   const st = S.settings;
-  const locked = S.live.status === 'running';
+  const locked = S.tests.some(x => x.status === 'running');
   const num = (key, label, hint, step = 'any', min = 0, max = 1e9) => `<div class="field"><div class="lbl"><b>${label}</b><span>${hint}</span></div><input class="input" type="number" inputmode="decimal" data-k="${key}" value="${st[key]}" step="${step}" min="${min}" max="${max}"></div>`;
   const sw = (key, label, hint, checked, attr = 'data-k') => `<div class="field"><div class="lbl"><b>${label}</b><span>${hint}</span></div><label class="switch"><input type="checkbox" ${attr}="${key}" ${checked ? 'checked' : ''}><span></span></label></div>`;
   main.innerHTML = `<div class="page">${topbar('تنظیمات')}
-    ${locked ? '<div class="note warn" style="margin-bottom:12px">یک تست زنده در جریان است. تغییرها روی بک‌تست و تست بعدی اثر دارند؛ تست فعلی با تنظیمات لحظه‌ی شروعش ادامه می‌دهد تا نتیجه‌اش دست‌کاری نشود.</div>' : ''}
+    ${locked ? '<div class="note warn" style="margin-bottom:12px">تست‌های در جریان با تنظیمات لحظه‌ی شروعشان ادامه می‌دهند تا نتیجه‌شان دست‌کاری نشود. تغییرها روی بک‌تست و تست‌های تازه اثر دارند.</div>' : ''}
     <div class="grid cols-2">
       <div class="card glass"><h3>ظاهر و اپ</h3>
         <div class="field"><div class="lbl"><b>تم</b><span>سورمه‌ای تیره یا سفید</span></div><div class="seg" id="themeSeg">${[['auto', 'خودکار'], ['light', 'روشن'], ['dark', 'تیره']].map(([k, n]) => `<button data-theme="${k}" class="${S.theme === k ? 'active' : ''}">${n}</button>`).join('')}</div></div>
@@ -791,7 +1069,7 @@ function pageSettings(main) {
       </div>
       <div class="card glass"><h3>سرمایه و دوره‌ی تست</h3>
         ${num('capital', 'سرمایه‌ی مجازی (USDT)', 'پیش‌فرض ۱۰۰۰ تتر', 1, 10)}
-        <div class="field"><div class="lbl"><b>مدت تست زنده</b><span>کوتاه‌تر = نتیجه‌ی سریع‌تر</span></div></div>
+        <div class="field"><div class="lbl"><b>مدت پیش‌فرض تست تازه</b><span>کوتاه‌تر = نتیجه‌ی سریع‌تر</span></div></div>
         <div class="chips" style="flex-wrap:wrap;margin:-4px 0 8px">${DURATIONS.map(([d, n]) => `<button class="chip ${Math.abs(st.testDays - d) < 1e-6 ? 'active' : ''}" data-dur="${d}">${n}</button>`).join('')}</div>
         <div class="field"><div class="lbl"><b>پروفایل</b><span>${activeProfile(st) === 'custom' ? 'سفارشی' : PROFILES[activeProfile(st)].desc}</span></div><div class="seg">${Object.entries(PROFILES).map(([k, pr]) => `<button data-prof="${k}" class="${activeProfile(st) === k ? 'active' : ''}">${pr.name}</button>`).join('')}</div></div>
         ${num('maxHoldHours', 'حداکثر نگه‌داری (ساعت)', 'بازار ۲۴ ساعته زنگ بسته شدن ندارد؛ بعد از این مدت پوزیشن بسته می‌شود', 0.5, 0.5, 72)}
@@ -799,7 +1077,7 @@ function pageSettings(main) {
       <div class="card glass"><h3>مدیر بودجه و ریسک <span class="muted">trader-budget / trader-risk</span></h3>
         ${num('riskPct', 'ریسک هر معامله (% حساب)', 'ضرر اگر حد ضرر بخورد؛ ۱٪ از ۱۰۰۰ = ۱۰ تتر', 0.1, 0.1, 10)}
         ${num('targetR', 'هدف سود (R)', 'چند برابر ریسک؛ trader-exit پیش‌فرض ۲R', 0.25, 0.5, 10)}
-        ${num('maxOpen', 'حداکثر پوزیشن باز', 'هم‌زمان روی دارایی‌های مختلف', 1, 1, 17)}
+        ${num('maxOpen', 'حداکثر پوزیشن باز', 'هم‌زمان روی دارایی‌های مختلف', 1, 1, 60)}
         ${num('maxPositionPct', 'بزرگ‌ترین پوزیشن (% حساب)', 'سقف حجم یک معامله', 1, 1, 100)}
         ${num('dailyLossPct', 'حد ضرر روزانه (% سرمایه)', 'رسیدن به آن یعنی تا فردا معامله‌ی جدید نه', 0.5, 0.5, 50)}
         ${num('maxTradesPerDay', 'سقف معامله در روز', 'برای تست پرفشار بالا گذاشته شده', 1, 1, 500)}
@@ -813,15 +1091,16 @@ function pageSettings(main) {
         ${sw('timeMachineFilter', 'فیلتر ماشین زمان', 'قبل از هر ورود ۴۰۰ بار شبیه‌سازی؛ اگر شانس از سربه‌سر کمتر بود رد می‌شود', st.timeMachineFilter)}
         ${num('tmMinEdge', 'حداقل برتری ماشین زمان (واحد درصد)', 'نسبت به نقطه‌ی سربه‌سر', 1, -50, 50)}
       </div>
-      <div class="card glass"><h3>مهارت‌ها (ستاپ‌های اسکنر)</h3>
-        ${Object.entries(STRATEGIES).map(([k, s]) => sw(k, s.name, s.desc, st.strategies[k], 'data-strat')).join('')}
+      <div class="card glass"><h3>ستاپ‌ها <span class="muted">پیش‌فرض تست‌های تازه و بک‌تست</span></h3>
+        ${[['trader', 'از مهارت‌های تریدر'], ['chart', 'از مهارت تحلیل‌گر چارت']].map(([src, title]) => `<div class="grp-h">${title}</div>` + Object.entries(STRATEGIES).filter(([, s]) => s.src === src).map(([k, s]) => sw(k, s.name, `<span class="tag fam">${FAMILIES[s.family]}</span> ${s.desc}`, st.strategies[k], 'data-strat')).join('')).join('')}
       </div>
-      <div class="card glass"><h3>دارایی‌ها</h3>
-        ${ASSETS.map(a => sw(a.symbol, a.name, `${a.symbol} · ${GROUPS[a.group]}${unavailable.has(a.symbol) ? ' · در دسترس نیست' : ''}`, st.symbols[a.symbol], 'data-sym-t')).join('')}
+      <div class="card glass"><h3>دارایی‌ها <span class="muted">${ASSETS.filter(a => st.symbols[a.symbol]).length} از ${ASSETS.length}</span></h3>
+        ${Object.entries(GROUPS).map(([g, gn]) => `<details class="grp" ${g === 'meme' || g === 'crypto' ? '' : 'open'}><summary><span>${gn} <span class="muted">(${ASSETS.filter(a => a.group === g && st.symbols[a.symbol]).length}/${ASSETS.filter(a => a.group === g).length})</span></span><span class="grp-acts"><button class="btn sm" data-grp-on="${g}">همه</button><button class="btn sm" data-grp-off="${g}">هیچ</button></span></summary>
+          ${ASSETS.filter(a => a.group === g).map(a => sw(a.symbol, a.name, `${a.symbol}${a.market === 'futures' ? ' · فیوچرز' : ''}${unavailable.has(a.symbol) ? ' · در دسترس نیست' : ''}`, st.symbols[a.symbol], 'data-sym-t')).join('')}</details>`).join('')}
       </div>
       <div class="card glass"><h3>داده‌ها</h3>
-        <div class="field"><div class="lbl"><b>بازگشت به تنظیمات پیش‌فرض</b><span>تست جاری دست نمی‌خورد</span></div><button class="btn sm" id="defBtn">پیش‌فرض</button></div>
-        <div class="field"><div class="lbl"><b>پاک کردن همه‌چیز</b><span>تست، بک‌تست و کندل‌های ذخیره‌شده روی این دستگاه</span></div><button class="btn sm danger" id="wipeBtn">پاک کردن</button></div>
+        <div class="field"><div class="lbl"><b>بازگشت به تنظیمات پیش‌فرض</b><span>تست‌های جاری دست نمی‌خورند</span></div><button class="btn sm" id="defBtn">پیش‌فرض</button></div>
+        <div class="field"><div class="lbl"><b>پاک کردن همه‌چیز</b><span>همه‌ی تست‌ها، بک‌تست و کندل‌های ذخیره‌شده روی این دستگاه</span></div><button class="btn sm danger" id="wipeBtn">پاک کردن</button></div>
         <p class="note" style="margin:8px 0 0">همه‌ی داده‌ها فقط روی همین دستگاه ذخیره می‌شوند. این اپ هیچ کلید، رمز یا حساب صرافی نمی‌خواهد و هیچ سفارش واقعی ثبت نمی‌کند.</p>
       </div>
     </div></div>`;
@@ -841,6 +1120,9 @@ function pageSettings(main) {
   });
   main.querySelectorAll('input[data-strat]').forEach(inp => inp.onchange = () => { S.settings.strategies[inp.dataset.strat] = inp.checked; persist(); });
   main.querySelectorAll('input[data-sym-t]').forEach(inp => inp.onchange = () => { S.settings.symbols[inp.dataset.symT] = inp.checked; persist(); });
+  const grp = (g, on) => { ASSETS.filter(a => a.group === g).forEach(a => { S.settings.symbols[a.symbol] = on; }); persist(); render(); };
+  main.querySelectorAll('[data-grp-on]').forEach(b => b.onclick = e => { e.preventDefault(); grp(b.dataset.grpOn, true); });
+  main.querySelectorAll('[data-grp-off]').forEach(b => b.onclick = e => { e.preventDefault(); grp(b.dataset.grpOff, false); });
   main.querySelectorAll('[data-theme]').forEach(b => b.onclick = () => { S.theme = b.dataset.theme; applyTheme(); render(); });
   main.querySelectorAll('[data-dur]').forEach(b => b.onclick = () => { S.settings.testDays = +b.dataset.dur; persist(); render(); });
   main.querySelectorAll('[data-prof]').forEach(b => b.onclick = () => { applyProfile(b.dataset.prof); render(); toast('پروفایل ' + PROFILES[b.dataset.prof].name + ' اعمال شد'); });
@@ -848,8 +1130,9 @@ function pageSettings(main) {
   $('#defBtn').onclick = () => { S.settings = mergeSettings({}); persist(); render(); toast('تنظیمات پیش‌فرض برگشت'); };
   $('#wipeBtn').onclick = async () => {
     if (!(await confirmBox('همه‌ی داده‌ها روی این دستگاه پاک شود؟', 'پاک کردن'))) return;
-    ['live', 'liveSnap', 'bt', 'seenEvents'].forEach(remove); await idbClear();
-    S.live = { status: 'idle' }; S.liveRes = null; S.bt.res = null; toast('پاک شد'); render();
+    S.tests.forEach(x => remove('snap:' + x.id));
+    ['live', 'liveSnap', 'bt', 'seenEvents', 'seen2'].forEach(remove); await idbClear();
+    S.tests = []; saveTests(); S.res = {}; S.seen = {}; S.view = null; S.bt.res = null; toast('پاک شد'); render();
   };
 }
 function installHint() {
@@ -862,6 +1145,7 @@ function installHint() {
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; if (S.page === 'settings') render(); });
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
 
+S.tests = loadTests();
 applyTheme();
 render();
 document.fonts?.ready.then(() => charts.forEach(c => c.redraw && c.redraw()));
@@ -883,9 +1167,9 @@ async function boot() {
     if (S.detail === s && S.onDetailTick) S.onDetailTick(price);
     if (!tickPending) { tickPending = true; setTimeout(() => { tickPending = false; onPrices(); }, 1200); }
   });
-  refreshLive(true);
-  setInterval(() => refreshLive(false), 20000);
+  refreshTests(true);
+  setInterval(() => refreshTests(false), 20000);
   setInterval(async () => { try { const t = await tickers(ASSETS.map(a => a.symbol)); for (const [s, v] of Object.entries(t)) S.t24[s] = v; } catch { /* */ } }, 120000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshLive(false); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshTests(false); });
 }
 boot();

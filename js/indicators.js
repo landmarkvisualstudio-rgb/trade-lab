@@ -90,3 +90,69 @@ export function rng(seed) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+// Population standard deviation over n bars
+export function stdev(values, n) {
+  const out = new Array(values.length).fill(NaN);
+  for (let i = n - 1; i < values.length; i++) {
+    let s = 0, q = 0;
+    for (let j = i - n + 1; j <= i; j++) { s += values[j]; q += values[j] * values[j]; }
+    const m = s / n; out[i] = Math.sqrt(Math.max(0, q / n - m * m));
+  }
+  return out;
+}
+
+// MACD 12/26/9
+export function macd(closes, fast = 12, slow = 26, sig = 9) {
+  const f = ema(closes, fast), s = ema(closes, slow);
+  const line = closes.map((_, i) => f[i] - s[i]);
+  const start = line.findIndex(x => !isNaN(x));
+  const signal = new Array(closes.length).fill(NaN);
+  if (start >= 0) { const e = ema(line.slice(start), sig); for (let i = 0; i < e.length; i++) signal[start + i] = e[i]; }
+  return { line, signal, hist: line.map((x, i) => x - signal[i]) };
+}
+
+// Supertrend (ATR 10, x3): returns line and direction (+1 up, -1 down)
+export function supertrend(h, l, c, n = 10, mult = 3) {
+  const a = atr(h, l, c, n);
+  const len = c.length, line = new Array(len).fill(NaN), dir = new Array(len).fill(0);
+  let upper = NaN, lower = NaN, d = 1;
+  for (let i = 0; i < len; i++) {
+    if (isNaN(a[i])) continue;
+    const mid = (h[i] + l[i]) / 2;
+    const bu = mid + mult * a[i], bl = mid - mult * a[i];
+    upper = isNaN(upper) || bu < upper || c[i - 1] > upper ? bu : upper;
+    lower = isNaN(lower) || bl > lower || c[i - 1] < lower ? bl : lower;
+    if (d === 1 && c[i] < lower) d = -1; else if (d === -1 && c[i] > upper) d = 1;
+    dir[i] = d; line[i] = d === 1 ? lower : upper;
+  }
+  return { line, dir };
+}
+
+// VWAP that resets every UTC day, with the volume-weighted standard deviation
+export function vwapDaily(t, h, l, c, v) {
+  const len = c.length, vw = new Array(len).fill(NaN), sd = new Array(len).fill(NaN);
+  let day = -1, pv = 0, vv = 0, p2v = 0;
+  for (let i = 0; i < len; i++) {
+    const d = Math.floor(t[i] / 86400000);
+    if (d !== day) { day = d; pv = 0; vv = 0; p2v = 0; }
+    const tp = (h[i] + l[i] + c[i]) / 3;
+    pv += tp * v[i]; vv += v[i]; p2v += tp * tp * v[i];
+    if (vv > 0) { vw[i] = pv / vv; sd[i] = Math.sqrt(Math.max(0, p2v / vv - vw[i] * vw[i])); }
+  }
+  return { vwap: vw, sd };
+}
+
+// Confirmed swing points: a pivot needs k lower highs (or higher lows) on each side
+export function pivots(h, l, k = 3) {
+  const hi = new Array(h.length).fill(false), lo = new Array(l.length).fill(false);
+  for (let i = k; i < h.length - k; i++) {
+    let isH = true, isL = true;
+    for (let j = 1; j <= k; j++) {
+      if (!(h[i] > h[i - j] && h[i] >= h[i + j])) isH = false;
+      if (!(l[i] < l[i - j] && l[i] <= l[i + j])) isL = false;
+    }
+    hi[i] = isH; lo[i] = isL;
+  }
+  return { hi, lo, k };
+}

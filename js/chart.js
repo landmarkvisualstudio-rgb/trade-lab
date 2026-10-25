@@ -9,7 +9,8 @@ const fmtFull = new Intl.DateTimeFormat('fa-IR-u-nu-latn', { month: 'short', day
 
 export function priceDecimals(p) {
   const a = Math.abs(p);
-  return a >= 1000 ? 2 : a >= 10 ? 2 : a >= 1 ? 4 : a >= 0.01 ? 5 : 7;
+  if (!a) return 2;
+  return a >= 10 ? 2 : a >= 1 ? 4 : a >= 0.01 ? 5 : Math.min(12, Math.ceil(-Math.log10(a)) + 3);
 }
 const fmtP = (p, d) => p.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 

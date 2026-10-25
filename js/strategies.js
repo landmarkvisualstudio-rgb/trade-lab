@@ -1,23 +1,50 @@
-// The setups from trader-scanner / trader-entry, on closed 5-minute bars.
-// dir = 1 for a long, -1 for a short (shorts are the mirror image, off by default).
-import { sma, rsi, atr, priorMax, priorMin } from './indicators.js';
+// The setups. The first five come from the trader-scanner / trader-entry skills;
+// the rest come from the chart-analyst skill (classic published rules, adapted to
+// closed 5-minute bars). dir = 1 for a long, -1 for a short.
+// Nothing here looks ahead: a bar only uses data up to its own close, and swing
+// points only count once they are confirmed k bars later.
+import { sma, ema, rsi, atr, priorMax, priorMin, stdev, macd, supertrend, vwapDaily, pivots } from './indicators.js';
 import { SESSIONS_UTC_MIN, BAR_MS } from './config.js';
 
 const DAY = 86400000;
+const cache = new WeakMap();
 
 export function prepare(series) {
+  if (cache.has(series)) return cache.get(series);
   const { t, o, h, l, c, v } = series;
   const idx = new Map();
   for (let i = 0; i < t.length; i++) idx.set(t[i], i);
-  return {
+  const sma20 = sma(c, 20), sd20 = stdev(c, 20);
+  const bbU = sma20.map((m, i) => m + 2 * sd20[i]), bbL = sma20.map((m, i) => m - 2 * sd20[i]);
+  const bw = sma20.map((m, i) => (4 * sd20[i]) / m);
+  const piv = pivots(h, l, 3);
+  const lowIdx = [], highIdx = [];
+  piv.lo.forEach((x, i) => x && lowIdx.push(i));
+  piv.hi.forEach((x, i) => x && highIdx.push(i));
+  const p = {
     ...series, idx,
-    sma20: sma(c, 20), sma50: sma(c, 50), rsi14: rsi(c, 14), atr14: atr(h, l, c, 14),
+    sma20, sma50: sma(c, 50), rsi14: rsi(c, 14), atr14: atr(h, l, c, 14),
     volAvg: sma(v, 20), hiC20: priorMax(c, 20), loC20: priorMin(c, 20),
+    ema9: ema(c, 9), ema21: ema(c, 21), ema200: ema(c, 200),
+    macd: macd(c), st: supertrend(h, l, c, 10, 3), vw: vwapDaily(t, h, l, c, v),
+    bbU, bbL, bw, hiH55: priorMax(h, 55), loL55: priorMin(l, 55),
+    lowIdx, highIdx, pk: piv.k,
   };
+  cache.set(series, p);
+  return p;
 }
 
-function minOf(a, from, to) { let m = Infinity; for (let j = from; j <= to; j++) if (a[j] < m) m = a[j]; return m; }
-function maxOf(a, from, to) { let m = -Infinity; for (let j = from; j <= to; j++) if (a[j] > m) m = a[j]; return m; }
+function minOf(a, from, to) { let m = Infinity; for (let j = Math.max(0, from); j <= to; j++) if (a[j] < m) m = a[j]; return m; }
+function maxOf(a, from, to) { let m = -Infinity; for (let j = Math.max(0, from); j <= to; j++) if (a[j] > m) m = a[j]; return m; }
+// confirmed pivots up to bar i (a pivot at j is known at j + k)
+function lastPivots(arr, i, k, n) {
+  let lo = 0, hi = arr.length - 1, pos = -1;
+  while (lo <= hi) { const m = (lo + hi) >> 1; if (arr[m] <= i - k) { pos = m; lo = m + 1; } else hi = m - 1; }
+  return pos < 0 ? [] : arr.slice(Math.max(0, pos - n + 1), pos + 1);
+}
+const barOfDay = (p, i) => Math.floor((p.t[i] % DAY) / BAR_MS);
+
+/* ---------- from the trader skills ---------- */
 
 // trader-entry: opening-range breakout, one per session per direction.
 function orb(p, i, dir, state) {
@@ -29,20 +56,20 @@ function orb(p, i, dir, state) {
     if (ti >= start) { s = { ...SESSIONS_UTC_MIN[k], start }; break; }
   }
   if (!s) return null;
-  const rangeEnd = s.start + 3 * BAR_MS;           // 15-minute range: 3 bars
-  if (ti < rangeEnd || ti >= rangeEnd + 2 * 3600000) return null; // 2-hour window
+  const rangeEnd = s.start + 3 * BAR_MS;
+  if (ti < rangeEnd || ti >= rangeEnd + 2 * 3600000) return null;
   const key = `${s.start}:${dir}`;
   if (state.orbDone.has(key)) return null;
   const ids = [0, 1, 2].map(k => p.idx.get(s.start + k * BAR_MS));
-  if (ids.some(x => x === undefined)) return null;  // a missing bar: no range
+  if (ids.some(x => x === undefined)) return null;
   const rh = Math.max(...ids.map(x => p.h[x])), rl = Math.min(...ids.map(x => p.l[x]));
   const broke = dir > 0 ? p.c[i] > rh : p.c[i] < rl;
   if (!broke) return null;
-  state.orbDone.add(key);                            // first close beyond the range only
+  state.orbDone.add(key);
   return { setup: 'orb', dir, stop: (rh + rl) / 2, note: `سشن ${s.name}، محدوده ${fmt(rl)} تا ${fmt(rh)}` };
 }
 
-// trader-scanner breakout_20d, on bars: a fresh close beyond the last 20 closes with volume.
+// trader-scanner breakout_20d on bars: a fresh close beyond the last 20 closes with volume.
 function breakout(p, i, dir) {
   if (i < 22 || isNaN(p.atr14[i]) || isNaN(p.volAvg[i - 1])) return null;
   const lvl = dir > 0 ? p.hiC20[i] : p.loC20[i];
@@ -91,13 +118,145 @@ function bounce(p, i, dir) {
   return { setup: 'bounce', dir, stop, note: `RSI قبلی ${p.rsi14[i - 1].toFixed(1)}` };
 }
 
-const FNS = { orb, breakout, flag, reclaim, bounce };
+/* ---------- from the chart-analyst skill ---------- */
 
-// Every bar is scanned (so one-per-session state stays right); the first enabled hit wins.
+// Trend: EMA 9/21 cross in the direction of the EMA 200.
+function emaCross(p, i, dir) {
+  if (i < 205 || isNaN(p.ema200[i])) return null;
+  const cross = dir > 0 ? p.ema9[i - 1] <= p.ema21[i - 1] && p.ema9[i] > p.ema21[i]
+                        : p.ema9[i - 1] >= p.ema21[i - 1] && p.ema9[i] < p.ema21[i];
+  if (!cross || (p.c[i] - p.ema200[i]) * dir <= 0) return null;
+  const stop = dir > 0 ? minOf(p.l, i - 6, i) - 0.2 * p.atr14[i] : maxOf(p.h, i - 6, i) + 0.2 * p.atr14[i];
+  return { setup: 'ema_cross', dir, stop, note: `EMA9 ${fmt(p.ema9[i])} / EMA21 ${fmt(p.ema21[i])}` };
+}
+
+// Trend: Supertrend (ATR 10 × 3) flips, RSI 50-70 (30-50 for a short).
+function superTrend(p, i, dir) {
+  if (i < 30 || !p.st.dir[i - 1]) return null;
+  const flip = p.st.dir[i - 1] === -dir && p.st.dir[i] === dir;
+  const r = p.rsi14[i];
+  const rsiOk = dir > 0 ? r > 50 && r < 70 : r < 50 && r > 30;
+  if (!flip || !rsiOk) return null;
+  return { setup: 'supertrend', dir, stop: p.st.line[i] - dir * 0.1 * p.atr14[i], note: `خط سوپرترند ${fmt(p.st.line[i])}` };
+}
+
+// Momentum: MACD crosses its signal on the far side of zero, with the EMA 200 trend.
+function macdCross(p, i, dir) {
+  if (i < 205 || isNaN(p.macd.signal[i - 1]) || isNaN(p.ema200[i])) return null;
+  const m = p.macd;
+  const cross = dir > 0 ? m.line[i - 1] <= m.signal[i - 1] && m.line[i] > m.signal[i] && m.line[i] < 0
+                        : m.line[i - 1] >= m.signal[i - 1] && m.line[i] < m.signal[i] && m.line[i] > 0;
+  if (!cross || (p.c[i] - p.ema200[i]) * dir <= 0) return null;
+  const piv = lastPivots(dir > 0 ? p.lowIdx : p.highIdx, i, p.pk, 1)[0];
+  const swing = piv !== undefined && i - piv < 40 ? (dir > 0 ? p.l[piv] : p.h[piv]) : (dir > 0 ? minOf(p.l, i - 10, i) : maxOf(p.h, i - 10, i));
+  return { setup: 'macd', dir, stop: swing - dir * 0.1 * p.atr14[i], note: `MACD ${p.macd.line[i].toPrecision(3)}` };
+}
+
+// Volatility: Bollinger squeeze. Band width was at its lowest in 120 bars within the
+// last 10 bars, then a close outside the band.
+function bbSqueeze(p, i, dir) {
+  if (i < 150 || isNaN(p.bw[i - 130])) return null;
+  const recent = minOf(p.bw, i - 10, i - 1), before = minOf(p.bw, i - 130, i - 11);
+  if (!(recent <= before)) return null;
+  const out = dir > 0 ? p.c[i] > p.bbU[i] && p.c[i - 1] <= p.bbU[i - 1] : p.c[i] < p.bbL[i] && p.c[i - 1] >= p.bbL[i - 1];
+  if (!out) return null;
+  return { setup: 'bb_squeeze', dir, stop: p.sma20[i], note: `پهنای باند ${(p.bw[i] * 100).toFixed(2)}٪` };
+}
+
+// Intraday: VWAP reclaim. Below VWAP for 15 minutes, then a strong close above it
+// on volume, with at least half the body above VWAP.
+function vwapReclaim(p, i, dir) {
+  if (dir < 0 || i < 30 || barOfDay(p, i) < 6) return null;
+  const vw = p.vw.vwap;
+  if (!(p.c[i - 3] < vw[i - 3] && p.c[i - 2] < vw[i - 2] && p.c[i - 1] < vw[i - 1])) return null;
+  const body = p.c[i] - p.o[i];
+  if (!(p.c[i] > vw[i] && body > 0 && (p.c[i] - vw[i]) / body >= 0.5 && p.v[i] > p.volAvg[i - 1])) return null;
+  return { setup: 'vwap_reclaim', dir, stop: Math.min(p.l[i], vw[i] * (1 - 0.0015)), note: `VWAP ${fmt(vw[i])}` };
+}
+
+// Mean reversion: a reversal candle at the VWAP −2σ band (+2σ for a short).
+function vwapDev(p, i, dir) {
+  if (i < 30 || barOfDay(p, i) < 6 || !(p.vw.sd[i] > 0)) return null;
+  const band = p.vw.vwap[i] - dir * 2 * p.vw.sd[i];
+  const o = p.o[i], c = p.c[i], h = p.h[i], l = p.l[i], body = Math.abs(c - o), range = h - l || 1e-12;
+  if (dir > 0) {
+    if (l > band) return null;
+    const hammer = (Math.min(o, c) - l) >= 2 * body && (c - l) / range >= 0.5;
+    const engulf = c > o && p.c[i - 1] < p.o[i - 1] && c >= p.o[i - 1] && o <= p.c[i - 1];
+    if (!hammer && !engulf) return null;
+    return { setup: 'vwap_dev', dir, stop: l * (1 - 0.0015), note: `باند ۲σ زیر VWAP: ${fmt(band)}` };
+  }
+  if (h < band) return null;
+  const star = (h - Math.max(o, c)) >= 2 * body && (h - c) / range >= 0.5;
+  const engulf = c < o && p.c[i - 1] > p.o[i - 1] && c <= p.o[i - 1] && o >= p.c[i - 1];
+  if (!star && !engulf) return null;
+  return { setup: 'vwap_dev', dir, stop: h * (1 + 0.0015), note: `باند ۲σ بالای VWAP: ${fmt(band)}` };
+}
+
+// Reversal: regular RSI divergence on two confirmed swing lows, triggered by a close
+// above the high since the second low (mirror for a short).
+function rsiDiv(p, i, dir) {
+  if (i < 40) return null;
+  const arr = dir > 0 ? p.lowIdx : p.highIdx;
+  const [j1, j2] = lastPivots(arr, i, p.pk, 2);
+  if (j1 === undefined || j2 === undefined || j2 - j1 < 5 || j2 - j1 > 60 || i - j2 > 20) return null;
+  const price = dir > 0 ? p.l : p.h;
+  const priceOk = dir > 0 ? price[j2] < price[j1] : price[j2] > price[j1];
+  const rsiOk = dir > 0 ? p.rsi14[j2] > p.rsi14[j1] && p.rsi14[j2] < 45 : p.rsi14[j2] < p.rsi14[j1] && p.rsi14[j2] > 55;
+  if (!priceOk || !rsiOk) return null;
+  const trig = dir > 0 ? maxOf(p.h, j2, i - 1) : minOf(p.l, j2, i - 1);
+  const fired = dir > 0 ? p.c[i] > trig && p.c[i - 1] <= trig : p.c[i] < trig && p.c[i - 1] >= trig;
+  if (!fired) return null;
+  return { setup: 'rsi_div', dir, stop: price[j2] - dir * 0.1 * p.atr14[i], note: `RSI ${p.rsi14[j1].toFixed(0)} → ${p.rsi14[j2].toFixed(0)}` };
+}
+
+// Price action: engulfing candle after a decline (rally for a short), with volume.
+function engulfing(p, i, dir) {
+  if (i < 30) return null;
+  const o = p.o, c = p.c;
+  const prior = dir > 0 ? c[i - 1] < p.sma20[i - 1] && c[i - 1] < c[i - 6] : c[i - 1] > p.sma20[i - 1] && c[i - 1] > c[i - 6];
+  if (!prior) return null;
+  const ok = dir > 0 ? c[i - 1] < o[i - 1] && c[i] > o[i] && o[i] <= c[i - 1] && c[i] >= o[i - 1]
+                     : c[i - 1] > o[i - 1] && c[i] < o[i] && o[i] >= c[i - 1] && c[i] <= o[i - 1];
+  if (!ok || Math.abs(c[i] - o[i]) <= Math.abs(c[i - 1] - o[i - 1]) || p.v[i] <= p.v[i - 1]) return null;
+  const stop = dir > 0 ? Math.min(p.l[i - 1], p.l[i]) : Math.max(p.h[i - 1], p.h[i]);
+  return { setup: 'engulfing', dir, stop, note: 'کندل پوشا بعد از ' + (dir > 0 ? 'افت' : 'رشد') };
+}
+
+// Market structure: two higher lows and a higher high, a new confirmed higher low,
+// then a close above the high since that low. Stop under the higher low.
+function structure(p, i, dir) {
+  if (i < 60) return null;
+  const lows = lastPivots(dir > 0 ? p.lowIdx : p.highIdx, i, p.pk, 3);
+  const highs = lastPivots(dir > 0 ? p.highIdx : p.lowIdx, i, p.pk, 2);
+  if (lows.length < 3 || highs.length < 2) return null;
+  const [L1, L2, L3] = lows, [H1, H2] = highs;
+  const P = dir > 0 ? p.l : p.h, Q = dir > 0 ? p.h : p.l;
+  const up = dir > 0 ? P[L1] < P[L2] && P[L2] < P[L3] && Q[H1] < Q[H2] : P[L1] > P[L2] && P[L2] > P[L3] && Q[H1] > Q[H2];
+  if (!up || !(H2 < L3) || i - L3 > 15) return null;
+  const trig = dir > 0 ? maxOf(p.h, L3, i - 1) : minOf(p.l, L3, i - 1);
+  const fired = dir > 0 ? p.c[i] > trig && p.c[i - 1] <= trig : p.c[i] < trig && p.c[i - 1] >= trig;
+  if (!fired) return null;
+  return { setup: 'structure', dir, stop: P[L3] - dir * 0.1 * p.atr14[i], note: `کف بالاتر ${fmt(P[L3])}` };
+}
+
+// Turtle System 2: a break of the 55-bar high (low), stop at 2N (N = ATR).
+function turtle(p, i, dir) {
+  if (i < 60 || isNaN(p.hiH55[i - 1])) return null;
+  const fresh = dir > 0 ? p.c[i] > p.hiH55[i] && p.c[i - 1] <= p.hiH55[i - 1] : p.c[i] < p.loL55[i] && p.c[i - 1] >= p.loL55[i - 1];
+  if (!fresh) return null;
+  return { setup: 'turtle', dir, stop: p.c[i] - dir * 2 * p.atr14[i], note: `سقف ۵۵ کندل ${fmt(dir > 0 ? p.hiH55[i] : p.loL55[i])}` };
+}
+
+const FNS = { orb, breakout, flag, reclaim, bounce, ema_cross: emaCross, supertrend: superTrend, macd: macdCross, bb_squeeze: bbSqueeze, vwap_reclaim: vwapReclaim, vwap_dev: vwapDev, rsi_div: rsiDiv, engulfing, structure, turtle };
+
+// Every bar is scanned by every setup (so one-per-session state stays right); the
+// first enabled hit wins.
 export function scan(p, i, settings, state) {
   const dirs = settings.allowShort ? [1, -1] : [1];
   let hit = null;
   for (const key of Object.keys(FNS)) {
+    if (settings.strategies[key] === false && key !== 'orb') continue;
     for (const d of dirs) {
       const s = FNS[key](p, i, d, state);
       if (s && settings.strategies[key] && !hit) hit = s;
@@ -112,6 +271,8 @@ function fmt(x) { return smartRound(x).toString(); }
 export function smartRound(x) {
   if (!isFinite(x)) return x;
   const a = Math.abs(x);
-  const d = a >= 1000 ? 2 : a >= 100 ? 2 : a >= 1 ? 4 : a >= 0.01 ? 5 : 8;
+  if (a === 0) return 0;
+  // same steps as before for normal prices; tiny meme-coin prices get more digits
+  const d = a >= 100 ? 2 : a >= 1 ? 4 : a >= 0.01 ? 5 : a >= 1e-5 ? 8 : Math.min(14, Math.ceil(-Math.log10(a)) + 4);
   return Number(x.toFixed(d));
 }
