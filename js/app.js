@@ -3,6 +3,7 @@ import { runSimulation, closeAllAtEnd, computeStats, signalStats, BLOCK_REASONS 
 import { ensureHistory, klines, tickers, liveStream, pool, unavailable, netState, toSeries, mode, probe } from './data.js';
 import { createCandleChart, createAreaChart, priceDecimals, sparkPath } from './chart.js';
 import { prepare } from './strategies.js';
+import { FACTORS, analysisLine } from './analyst.js';
 import { replay } from './timemachine.js';
 import { load, save, remove, idbClear, setDemoStorage } from './store.js';
 
@@ -213,7 +214,9 @@ function tradeRow(x, live = false, res = null) {
   return `<div class="row trade click" data-sym="${x.symbol}">${coin(x.symbol)}
     <div class="main"><div class="t1">${esc(a?.name || x.symbol)} ${side} ${reason}</div>
     <div class="t2">${STRATEGIES[x.setup]?.name} · <span class="num">${fp(x.entry)} → ${fp(px)}</span> · حد ضرر <span class="num">${fp(x.stop)}</span> · هدف <span class="num">${fp(x.target)}</span></div>
-    <div class="t2">${fdt(x.entryTime)}${live ? '' : ' تا ' + fdt(x.exitTime)} · <span class="num">${nf(x.notional)}</span> USDT</div></div>
+    <div class="t2">${fdt(x.entryTime)}${live ? '' : ' تا ' + fdt(x.exitTime)} · <span class="num">${nf(x.notional)}</span> USDT</div>
+    ${x.ana ? `<div class="t2 ana-line"><span class="grade g${x.ana.grade}">${x.ana.grade}</span> ${esc(analysisLine(x.ana))}</div>` : ''}
+    ${x.learn ? `<div class="t2 ana-line">🧠 ${esc(x.learn.why)}${x.learn.mult && x.learn.mult !== 1 ? ` · ریسک ×${x.learn.mult.toFixed(2)}` : ''}</div>` : ''}</div>
     <div class="end"><div class="t1 num ${cls(pnl)}">${signed(pnl)}</div><div class="t2 num ${cls(R)}">${signed(R, 2)}R</div></div></div>`;
 }
 
@@ -360,9 +363,15 @@ const ASSET_SETS = {
   commod: ['طلا، نقره، مس و انرژی', () => ASSETS.filter(a => a.group === 'metal' || a.group === 'energy').map(a => a.symbol)],
   settings: ['طبق تنظیمات', () => ASSETS.filter(a => S.settings.symbols[a.symbol]).map(a => a.symbol)],
 };
+const BRAINS = {
+  learn: ['تحلیل‌گر + خودآموز', 'قبل از هر ورود، چارت با چک‌لیست تحلیل‌گر بررسی می‌شود. ربات از نتیجه‌ی هر سیگنال درس می‌گیرد و بر اساس تجربه، معامله‌های بد را رد و معامله‌های خوب را بزرگ‌تر می‌کند. قبل از شروع، ۳ روز گذشته‌ی بازار را تماشا می‌کند تا با تجربه شروع کند.'],
+  analyst: ['فقط تحلیل‌گر', 'هر سیگنال با چک‌لیست تحلیل‌گر امتیاز می‌گیرد و سیگنال‌های با امتیاز منفی رد می‌شوند؛ بدون یادگیری.'],
+  off: ['ساده', 'فقط قوانین ستاپ‌ها، مثل نسخه‌ی اول؛ برای مقایسه.'],
+};
+const brainOf = st => st.learn ? 'learn' : st.analyst ? 'analyst' : 'off';
 function freshDraft() {
   const prof = activeProfile(S.settings);
-  return { name: `تست ${faNum(S.tests.length + 1)}`, capital: S.settings.capital, days: S.settings.testDays, profile: prof === 'custom' ? 'custom' : prof, strat: 'all', assets: 'all' };
+  return { name: `تست ${faNum(S.tests.length + 1)}`, capital: S.settings.capital, days: S.settings.testDays, profile: prof === 'custom' ? 'custom' : prof, strat: 'all', assets: 'all', brain: brainOf(S.settings) };
 }
 const faNum = n => String(n).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
 function draftSettings(dr) {
@@ -374,6 +383,8 @@ function draftSettings(dr) {
   st.strategies = Object.fromEntries(Object.keys(STRATEGIES).map(k => [k, ks.has(k)]));
   const ss = new Set(ASSET_SETS[dr.assets][1]());
   st.symbols = Object.fromEntries(ASSETS.map(a => [a.symbol, ss.has(a.symbol)]));
+  st.analyst = dr.brain !== 'off';
+  st.learn = dr.brain === 'learn';
   return st;
 }
 function newTestForm(dr) {
@@ -385,6 +396,8 @@ function newTestForm(dr) {
     <div class="pick"><div class="pick-l">پروفایل</div><div class="chips">${chips([...Object.entries(PROFILES).map(([k, p]) => [k, p.name]), ['custom', 'طبق تنظیمات']], dr.profile, 'nprof')}</div></div>
     <div class="pick"><div class="pick-l">ستاپ‌ها</div><div class="chips">${chips(Object.entries(STRAT_SETS).map(([k, v]) => [k, v[0]]), dr.strat, 'nstrat')}</div></div>
     <div class="pick"><div class="pick-l">دارایی‌ها</div><div class="chips">${chips(Object.entries(ASSET_SETS).map(([k, v]) => [k, v[0]]), dr.assets, 'nasset')}</div></div>
+    <div class="pick"><div class="pick-l">مغز ربات</div><div class="chips">${chips(Object.entries(BRAINS).map(([k, v]) => [k, v[0]]), dr.brain, 'nbrain')}</div></div>
+    <div class="muted ntf-brain">${BRAINS[dr.brain][1]}</div>
     <div class="muted ntf-sum">${draftSummary(dr)}</div>
   </div>`;
 }
@@ -400,13 +413,14 @@ function bindNewTestForm(root, dr, rerender) {
   root.querySelectorAll('[data-nprof]').forEach(b => b.onclick = () => { dr.profile = b.dataset.nprof; rerender(); });
   root.querySelectorAll('[data-nstrat]').forEach(b => b.onclick = () => { dr.strat = b.dataset.nstrat; rerender(); });
   root.querySelectorAll('[data-nasset]').forEach(b => b.onclick = () => { dr.assets = b.dataset.nasset; rerender(); });
+  root.querySelectorAll('[data-nbrain]').forEach(b => b.onclick = () => { dr.brain = b.dataset.nbrain; rerender(); });
 }
 function startTest(dr) {
   const settings = draftSettings(dr);
   if (!Object.values(settings.strategies).some(Boolean)) return toast('هیچ ستاپی انتخاب نشده');
   if (!Object.values(settings.symbols).some(Boolean)) return toast('هیچ دارایی‌ای انتخاب نشده');
   const start = Math.ceil(Date.now() / BAR_MS) * BAR_MS;
-  const t = { id: newId(), name: (dr.name || '').trim() || `تست ${faNum(S.tests.length + 1)}`, status: 'running', start, end: start + dr.days * DAY, settings, warmup: DEFAULT_WARMUP };
+  const t = { id: newId(), name: (dr.name || '').trim() || `تست ${faNum(S.tests.length + 1)}`, status: 'running', start, end: start + dr.days * DAY, settings, warmup: DEFAULT_WARMUP + (settings.learn ? Math.round((settings.learnWarmDays ?? 3) * 288) : 0) };
   S.tests.push(t); saveTests();
   S.seen[t.id] = 0; save('seen2', S.seen);
   S.focus = t.id;
@@ -481,16 +495,18 @@ const fromBits = (s, n) => Array.from({ length: n }, (_, i) => !!((parseInt(s[i 
 function settingsDiff(st) {
   const d = {};
   for (const [k, v] of Object.entries(st)) {
-    if (k === 'strategies' || k === 'symbols') continue;
+    if (k === 'strategies' || k === 'symbols' || k === 'analyst' || k === 'learn') continue;
     if (DEFAULT_SETTINGS[k] !== v) d[k] = v;
   }
+  if (st.analyst) d.an = 1;   // sent explicitly: tests made before these existed have them off
+  if (st.learn) d.le = 1;
   d.sk = toBits(STRAT_KEYS.map(k => !!st.strategies[k]));
   d.sy = toBits(SYM_KEYS.map(s => !!st.symbols[s]));
   return d;
 }
 function settingsFromDiff(d, legacy) {
-  const { sk, sy, strategies, symbols, ...rest } = d || {};
-  const st = { ...DEFAULT_SETTINGS, ...rest };
+  const { sk, sy, an, le, strategies, symbols, analyst, learn, ...rest } = d || {};
+  const st = { ...DEFAULT_SETTINGS, ...rest, analyst: !!an, learn: !!le };
   if (legacy) { // version 1: a diff against the old defaults (5 setups, 17 assets on)
     st.strategies = Object.fromEntries(STRAT_KEYS.map((k, i) => [k, i < LEGACY_STRATS ? (strategies?.[k] ?? true) : false]));
     st.symbols = Object.fromEntries(SYM_KEYS.map((s, i) => [s, i < LEGACY_SYMS ? (symbols?.[s] ?? true) : false]));
@@ -634,7 +650,7 @@ function testCard(t) {
   const eq = res ? thin(res.equity, 120) : snap?.equity;
   return `<div class="card glass test-card click" data-test="${t.id}">
     <div class="tc-head"><b>${esc(t.name)}</b>${statusTag(t)}</div>
-    <div class="tc-meta">${durLabel(testDays(t))} · ${profName(t.settings)} · ${testStrats(t).length} ستاپ · ${testSymbols(t).length} دارایی</div>
+    <div class="tc-meta">${durLabel(testDays(t))} · ${profName(t.settings)} · ${testStrats(t).length} ستاپ · ${testSymbols(t).length} دارایی${t.settings.learn ? ' · <span class="tag brain">🧠 خودآموز</span>' : t.settings.analyst ? ' · <span class="tag brain">تحلیل‌گر</span>' : ''}</div>
     <div class="tc-eq num" data-teq="${t.id}">${st ? nf(st.equity) : '<span class="skeleton">1,000.00</span>'}<small>USDT</small></div>
     <div class="pnl-row" data-tpnl="${t.id}">${st ? pnlPills(st, cap) : ''}</div>
     ${miniSpark(eq, cap)}
@@ -753,8 +769,9 @@ function pageTest(main, t) {
       ${st ? verdictCard(st, res?.bench, L.settings.targetR) : `<div class="card glass"><div class="empty">${now < t.start ? 'تست از کندل ۵ دقیقه‌ای بعدی شروع می‌شود…' : '<span class="loader"></span><br>در حال ساخت نتیجه از کندل‌های بازار…'}</div></div>`}
       <div class="span-2">${st ? kpiTiles(st, { k: 'سیگنال اسکنر', v: res?.signals ?? '—', s: `${durLabel(testDays(t))} · ${profName(L.settings)}`, R: L.settings.targetR }) : ''}</div>
       <div class="card glass span-2"><h3>تنظیمات این تست</h3><div class="tc-cfg">
-        <span>پروفایل: <b>${profName(L.settings)}</b></span><span>ریسک هر معامله: <b class="num">${L.settings.riskPct}%</b></span><span>هدف: <b class="num">${L.settings.targetR}R</b></span><span>نگه‌داری: <b class="num">${L.settings.maxHoldHours}</b> ساعت</span><span>پوزیشن هم‌زمان: <b class="num">${L.settings.maxOpen}</b></span><span>شورت: <b>${L.settings.allowShort ? 'روشن' : 'خاموش'}</b></span></div>
+        <span>پروفایل: <b>${profName(L.settings)}</b></span><span>ریسک هر معامله: <b class="num">${L.settings.riskPct}%</b></span><span>هدف: <b class="num">${L.settings.targetR}R</b></span><span>نگه‌داری: <b class="num">${L.settings.maxHoldHours}</b> ساعت</span><span>پوزیشن هم‌زمان: <b class="num">${L.settings.maxOpen}</b></span><span>شورت: <b>${L.settings.allowShort ? 'روشن' : 'خاموش'}</b></span><span>مغز ربات: <b>${BRAINS[brainOf(L.settings)][0]}</b></span></div>
         <div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.9">ستاپ‌ها: ${enabled.map(k => STRATEGIES[k].name).join('، ')}<br>دارایی‌ها: ${testSymbols(t).map(s => assetBySymbol[s]?.short || s).join('، ')}</div></div>
+      ${res?.learn ? `<div class="span-2">${experienceCard(res)}</div>` : res?.decisions ? `<div class="span-2">${decisionsCard(res)}</div>` : ''}
       ${res ? `<div class="span-2">${accuracyCard(res, enabled)}</div>` : ''}
       <div class="card glass span-2"><h3>منحنی سرمایه <span class="muted">هر نقطه = بسته شدن یک کندل ۵ دقیقه‌ای</span></h3><div class="chart-box" id="eqChart"></div></div>
       <div class="card glass"><h3>پوزیشن‌های باز <span class="muted">قیمت زنده</span></h3><div class="list" id="openList">${openList(res)}</div></div>
@@ -773,6 +790,50 @@ function pageTest(main, t) {
   $('#allTrades').onclick = e => { e.preventDefault(); S.tradesSrc = t.id; go('trades'); };
   main.querySelectorAll('.row[data-sym]').forEach(r => r.onclick = () => openDetail(r.dataset.sym));
   updateLoading();
+}
+/* the analyst's and the memory's decisions, and what the memory has learned */
+const DEC = { taken: 'معامله شد', learned: 'رد به خاطر تجربه', analyst: 'رد به خاطر تحلیل چارت', other: 'رد توسط مدیر ریسک', skipped: 'پوزیشن باز بود یا وقت گذشت' };
+function decisionRows(res) {
+  const d = res.decisions || {};
+  return ['taken', 'learned', 'analyst', 'other'].filter(k => d[k]).map(k => {
+    const x = d[k], avg = x.sumR / x.n;
+    return `<div class="row"><div class="main"><div class="t1">${DEC[k]}</div><div class="t2">${x.n} سیگنال · ${nf(x.wins / x.n * 100, 0)}% به هدف رسید</div></div><div class="end"><div class="t1 num ${cls(avg)}">${signed(avg, 2)}R</div><div class="t2">میانگین بعد از کارمزد</div></div></div>`;
+  }).join('');
+}
+function decisionsCard(res) {
+  return `<div class="card glass"><h3>تصمیم‌های تحلیل‌گر <span class="muted">هر سیگنال تا نتیجه دنبال شد</span></h3><div class="list">${decisionRows(res) || '<div class="empty">هنوز سیگنالی به نتیجه نرسیده</div>'}</div>
+    <p class="muted" style="font-size:12px;margin:10px 0 0;line-height:1.9">اگر میانگین سیگنال‌های ردشده از معامله‌های انجام‌شده بدتر باشد، یعنی تحلیل‌گر درست رد کرده است.</p></div>`;
+}
+function experienceCard(res) {
+  const Lm = res.learn;
+  const w = Lm.weights, maxW = Math.max(0.05, ...Object.values(w).map(Math.abs));
+  const bars = Object.entries(FACTORS).map(([k, name]) => {
+    const v = w[k] || 0, width = Math.abs(v) / maxW * 50;
+    const side = v >= 0 ? `left:${50 - width}%;right:50%` : `right:${50 - width}%;left:50%`;
+    return `<div class="bar-row"><div><b style="font-weight:600">${name}</b></div><div class="bar-track"><span class="mid"></span><div style="${side};background:var(--${v >= 0 ? 'up' : 'down'})"></div></div><div class="num ${cls(v)}" style="font-weight:700;min-width:70px;text-align:left">${signed(v, 2)}R</div></div>`;
+  }).join('');
+  const status = r => r.est < -0.12 ? '<span class="tag down">کنار گذاشته</span>' : r.est > 0.15 ? '<span class="tag up">تقویت‌شده</span>' : '<span class="tag">عادی</span>';
+  const rowHtml = r => `<div class="row"><div class="main"><div class="t1">${STRATEGIES[r.setup]?.name || r.setup} · ${GROUPS[r.group] || r.group}</div><div class="t2">${r.n} درس · ${nf(r.winRate, 0)}% برد</div></div><div class="end"><div class="t1 num ${cls(r.avgR)}">${signed(r.avgR, 2)}R</div><div class="t2">${status(r)}</div></div></div>`;
+  const rows = Lm.rows.filter(r => r.n >= 3);
+  const best = [...rows].sort((a, b) => b.est - a.est).slice(0, 5), worst = [...rows].sort((a, b) => a.est - b.est).filter(r => r.est < 0).slice(0, 5);
+  const curve = Lm.history.length > 2 ? `<svg class="tc-spark" viewBox="0 0 120 34" preserveAspectRatio="none" style="height:46px"><path d="${sparkPath(Lm.history.map(x => x[1]), 120, 34)}" fill="none" stroke="var(--accent)" stroke-width="1.6"/></svg>` : '';
+  const d = res.decisions || {}, tk = d.taken, lr = d.learned;
+  return `<div class="card glass"><h3>🧠 حافظه‌ی تجربه <span class="muted">ربات از نتیجه‌ی هر سیگنال درس می‌گیرد</span></h3>
+    <div class="kpis" style="margin-bottom:14px">
+      <div class="kpi glass flat"><div class="k">درس‌های یادگرفته</div><div class="v num">${Lm.lessons}</div><div class="s">${Lm.ready ? 'حافظه تصمیم می‌گیرد' : 'هنوز در حال تجربه'}</div></div>
+      <div class="kpi glass flat"><div class="k">میانگین همه‌ی تجربه‌ها</div><div class="v num ${cls(Lm.overall)}">${signed(Lm.overall, 2)}R</div><div class="s">بعد از کارمزد</div></div>
+      <div class="kpi glass flat"><div class="k">معامله‌های انجام‌شده</div><div class="v num ${cls(tk ? tk.sumR / tk.n : 0)}">${tk ? signed(tk.sumR / tk.n, 2) + 'R' : '—'}</div><div class="s">${tk ? tk.n + ' معامله‌ی به‌نتیجه‌رسیده' : 'هنوز نتیجه‌ای نیست'}</div></div>
+      <div class="kpi glass flat"><div class="k">ردشده به خاطر تجربه</div><div class="v num ${cls(lr ? lr.sumR / lr.n : 0)}">${lr ? signed(lr.sumR / lr.n, 2) + 'R' : '—'}</div><div class="s">${lr ? lr.n + ' سیگنال؛ اگر منفی باشد، ردشان درست بود' : 'هنوز چیزی رد نشده'}</div></div>
+    </div>
+    <div class="grid cols-2">
+      <div><div class="grp-h">کدام نشانه‌های چارت واقعاً مهم بودند</div><div class="bars">${bars}</div>
+        <p class="muted" style="font-size:11.5px;margin:8px 0 0;line-height:1.8">عدد مثبت یعنی وقتی این نشانه به نفع معامله بود، نتیجه بهتر شد. ربات وزن هر نشانه را از تجربه یاد می‌گیرد.</p></div>
+      <div><div class="grp-h">بهترین تجربه‌ها</div><div class="list">${best.map(rowHtml).join('') || '<div class="empty">هنوز کافی نیست</div>'}</div>
+        ${worst.length ? `<div class="grp-h">چیزهایی که یاد گرفت انجام ندهد</div><div class="list">${worst.map(rowHtml).join('')}</div>` : ''}</div>
+    </div>
+    ${curve ? `<div class="grp-h">منحنی یادگیری <span class="muted">میانگین نتیجه‌ی تجربه‌ها در طول زمان</span></div>${curve}` : ''}
+    <details class="more"><summary>همه‌ی تصمیم‌ها ▾</summary><div class="list" style="margin-top:8px">${decisionRows(res)}</div></details>
+    <p class="muted" style="font-size:12px;margin:10px 0 0;line-height:1.9">ربات قبل از شروع ۳ روز بازار را تماشا کرد تا با تجربه شروع کند. تجربه‌های تازه وزن بیشتری دارند و ستاپی که کنار گذاشته شده همچنان زیر نظر است تا اگر دوباره خوب شد، برگردد.</p></div>`;
 }
 const pnlPills = (st, cap) => `<span class="pill ${st.pnl >= 0 ? 'up' : 'down'} num">${signed(st.pnl)} USDT</span><span class="pill ${st.pnl >= 0 ? 'up' : 'down'} num">${signed(st.pnl / cap * 100)}%</span>`;
 function openList(res) {
@@ -1035,7 +1096,7 @@ async function runBacktest() {
   B.error = ''; B.running = `دریافت داده 0/${syms.length}`; render();
   const data = {}; let done = 0;
   await pool(syms, 4, async s => {
-    try { data[s] = await ensureHistory(s, start - WARMUP_BARS * BAR_MS, end); } catch { /* */ }
+    try { data[s] = await ensureHistory(s, start - (WARMUP_BARS + (S.settings.learn ? Math.round((S.settings.learnWarmDays ?? 3) * 288) : 0)) * BAR_MS, end); } catch { /* */ }
     done++; B.running = `دریافت داده ${done}/${syms.length}`;
     const b = $('#runBt'); if (b) b.innerHTML = `<span class="loader"></span> ${B.running}`;
   });
@@ -1088,6 +1149,8 @@ function pageSettings(main) {
         ${num('feeSpotPct', 'کارمزد اسپات (% هر طرف)', 'Binance: ۰.۱٪ taker', 0.01, 0, 1)}
         ${num('feeFuturesPct', 'کارمزد فیوچرز (% هر طرف)', 'Binance: ۰.۰۵٪ taker', 0.01, 0, 1)}
         ${num('slippagePct', 'لغزش قیمت (% هر پر شدن)', 'فاصله‌ی قیمت اجرا با قیمت دیده‌شده', 0.01, 0, 1)}
+        ${sw('analyst', 'تحلیل‌گر چارت', 'قبل از هر ورود، چارت با چک‌لیست مهارت تحلیل‌گر امتیاز می‌گیرد (پیش‌فرض تست‌های تازه)', st.analyst)}
+        ${sw('learn', 'خودآموز (حافظه‌ی تجربه)', 'از نتیجه‌ی هر سیگنال یاد می‌گیرد و تصمیم‌های بعدی را با آن می‌گیرد', st.learn)}
         ${sw('timeMachineFilter', 'فیلتر ماشین زمان', 'قبل از هر ورود ۴۰۰ بار شبیه‌سازی؛ اگر شانس از سربه‌سر کمتر بود رد می‌شود', st.timeMachineFilter)}
         ${num('tmMinEdge', 'حداقل برتری ماشین زمان (واحد درصد)', 'نسبت به نقطه‌ی سربه‌سر', 1, -50, 50)}
       </div>

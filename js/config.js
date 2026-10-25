@@ -126,6 +126,10 @@ export const DEFAULT_SETTINGS = {
   strategies: Object.fromEntries(Object.keys(STRATEGIES).map(k => [k, true])),
   symbols: Object.fromEntries(ASSETS.map(a => [a.symbol, true])),
   notifications: false,
+  analyst: true,              // chart-analyst checklist scores every signal before entry
+  learn: true,                // experience memory: learns from every resolved signal
+  learnWarmDays: 3,           // days of history watched before the start, to begin with experience
+  minScore: 0,                // analyst score needed while the memory is still young
 };
 
 export const WARMUP_BARS = 300;

@@ -5,6 +5,8 @@
 import { BAR_MS, assetBySymbol } from './config.js';
 import { prepare, scan, newScanState, smartRound } from './strategies.js';
 import { replay } from './timemachine.js';
+import { analyze } from './analyst.js';
+import { newLearner, learn, judge, summary } from './learner.js';
 
 const TEHRAN_OFFSET = 3.5 * 3600000;
 export const dayKey = t => Math.floor((t + TEHRAN_OFFSET) / 86400000);
@@ -20,6 +22,8 @@ export const BLOCK_REASONS = {
   openRisk: 'ریسک باز روزانه پر است',
   cooldown: 'استراحت بعد از ضرر روی همین نماد',
   timeMachine: 'ماشین زمان: شانس کافی نبود',
+  analyst: 'تحلیل‌گر: نشانه‌های چارت ضعیف بود',
+  learned: 'تجربه: این نوع معامله اخیراً ضرر داده',
 };
 
 export function runSimulation({ data, settings, start, end, capital }) {
@@ -29,9 +33,18 @@ export function runSimulation({ data, settings, start, end, capital }) {
   const preps = {}, scanStates = {};
   for (const s of syms) { preps[s] = prepare(data[s]); scanStates[s] = newScanState(); }
 
+  // analyst and experience memory (off for tests made before they existed)
+  const LEARN = !!S.learn, ANALYST = !!S.analyst || LEARN;
+  const minScore = S.minScore ?? 0;
+  // with learning, the robot first watches a few days before the start to gain experience
+  const warmFrom = LEARN ? start - (S.learnWarmDays ?? 3) * 86400000 : start;
+  const L = LEARN ? newLearner() : null;
+  const waiting = [], observed = [];
+  let seq = 0;
+
   // every bar time inside the test, across all assets
   const times = new Set();
-  for (const s of syms) for (const t of preps[s].t) if (t >= start && t < end) times.add(t);
+  for (const s of syms) for (const t of preps[s].t) if (t >= warmFrom && t < end) times.add(t);
   const timeline = [...times].sort((a, b) => a - b);
 
   let cash = startCap, peak = startCap, maxDD = 0, maxDDusd = 0, feesTotal = 0;
@@ -66,39 +79,48 @@ export function runSimulation({ data, settings, start, end, capital }) {
     events.push({ t, type: 'exit', symbol: s, id: pos.id, reason, pnl });
   }
 
+  const mark = (sig, d) => { if (sig.obs) sig.obs.dec = d; };
   function tryEnter(s, sig, p, i, t) {
     const dir = sig.dir;
+    const blk = reason => { mark(sig, reason === 'analyst' || reason === 'learned' ? reason : 'other'); return block(reason, s, t); };
     const fill = p.o[i] * (1 + dir * slip);
     const stop = sig.stop;
-    if ((fill - stop) * dir <= 0) return block('gap', s, t);
+    if ((fill - stop) * dir <= 0) return blk('gap', s, t);
     const perUnit = Math.abs(fill - stop);
     const stopPct = perUnit / fill * 100;
-    if (stopPct < S.minStopPct) return block('tightStop', s, t);
-    if (stopPct > S.maxStopPct) return block('wideStop', s, t);
-    if (open.size >= S.maxOpen) return block('maxOpen', s, t);
+    if (stopPct < S.minStopPct) return blk('tightStop', s, t);
+    if (stopPct > S.maxStopPct) return blk('wideStop', s, t);
+    if (open.size >= S.maxOpen) return blk('maxOpen', s, t);
     const d = day(t);
-    if (d.trades >= S.maxTradesPerDay) return block('perDay', s, t);
+    if (d.trades >= S.maxTradesPerDay) return blk('perDay', s, t);
     const dailyLimit = startCap * S.dailyLossPct / 100;
-    if (d.realized <= -dailyLimit) return block('dailyLoss', s, t);
-    if ((cooldownUntil[s] || 0) > t) return block('cooldown', s, t);
+    if (d.realized <= -dailyLimit) return blk('dailyLoss', s, t);
+    if ((cooldownUntil[s] || 0) > t) return blk('cooldown', s, t);
+    // the analyst and the experience memory have their say
+    let mult = 1, lj = null;
+    if (LEARN) {
+      lj = judge(L, { setup: sig.setup, group: assetBySymbol[s]?.group, grade: sig.ana?.grade, symbol: s, ana: sig.ana });
+      if (lj.ready) { if (lj.avoid) return blk('learned'); mult = lj.mult; }
+      else if (sig.ana && sig.ana.score < minScore) return blk('analyst');
+    } else if (ANALYST && sig.ana && sig.ana.score < minScore) return blk('analyst');
     const target = fill + dir * S.targetR * perUnit;
 
     if (S.timeMachineFilter) {
       const tm = replay(p, i - 1, { entry: fill, stop, target, dir, horizon: Math.round(S.maxHoldHours * 12), replays: 400, seed: 19 });
-      if (!tm || tm.edge < S.tmMinEdge) return block('timeMachine', s, t);
+      if (!tm || tm.edge < S.tmMinEdge) return blk('timeMachine', s, t);
       sig.tm = { pTarget: tm.pTarget, pStop: tm.pStop, edge: tm.edge, verdict: tm.verdict };
     }
 
     // trader-budget: the smallest of the limits decides the size
     const eq = equityNow();
-    let qty = (eq * S.riskPct / 100) / perUnit;
+    let qty = (eq * S.riskPct * mult / 100) / perUnit;
     const cap = Math.min(eq * S.maxPositionPct / 100, cash - eq * S.cashBufferPct / 100);
     let decidedBy = 'risk';
     if (qty * fill > cap) { qty = cap / fill; decidedBy = 'cap'; }
-    if (qty <= 0 || qty * fill < S.minOrder) return block('cash', s, t);
+    if (qty <= 0 || qty * fill < S.minOrder) return blk('cash', s, t);
     const riskUSDT = qty * perUnit;
     const allowance = dailyLimit + Math.min(0, d.realized);
-    if (openRisk() + riskUSDT > allowance) return block('openRisk', s, t);
+    if (openRisk() + riskUSDT > allowance) return blk('openRisk', s, t);
 
     const notional = qty * fill;
     const entryFee = notional * feePct(s);
@@ -108,19 +130,52 @@ export function runSimulation({ data, settings, start, end, capital }) {
       id: nextId++, symbol: s, setup: sig.setup, dir, note: sig.note, signalTime: t - BAR_MS,
       entryTime: t, entryIndex: i, entry: fill, stop: smartRound(stop), target: smartRound(target),
       qty, notional, riskUSDT, entryFee, margin: notional, decidedBy, tm: sig.tm || null,
+      ana: sig.ana || null, learn: lj && lj.ready ? { est: lj.est, mult, why: lj.why } : lj ? { why: lj.why } : null,
     };
     open.set(s, pos);
+    mark(sig, 'taken');
     d.trades++;
     events.push({ t, type: 'entry', symbol: s, id: pos.id, setup: sig.setup, dir });
   }
 
   const maxHold = Math.max(1, Math.round(S.maxHoldHours * 12));
 
+  // follow a signal forward to the bar where its outcome is decided (net of costs)
+  function observe(s, p, i, t, hit) {
+    const j = i + 1;
+    if (j >= p.t.length) return null;
+    const dir = hit.dir, entry = p.o[j], risk = (entry - hit.stop) * dir;
+    if (!(risk > 0) || risk / entry * 100 < S.minStopPct || risk / entry * 100 > S.maxStopPct) return null;
+    const target = entry + dir * S.targetR * risk;
+    let R = null, k = j;
+    for (; k < p.t.length && k < j + maxHold; k++) {
+      if (dir > 0 ? p.l[k] <= hit.stop : p.h[k] >= hit.stop) { R = -1; break; }
+      if (dir > 0 ? p.h[k] >= target : p.l[k] <= target) { R = S.targetR; break; }
+      if (k === j + maxHold - 1) { R = (p.c[k] - entry) * dir / risk; break; }
+    }
+    if (R === null) return null; // not decided yet: nothing to learn
+    const cost = (2 * feePct(s) + 2 * slip) * entry / risk;
+    return { setup: hit.setup, group: assetBySymbol[s]?.group, symbol: s, grade: hit.ana?.grade, ana: hit.ana, R: R - cost, tRes: p.t[k] + BAR_MS, live: t >= start, dec: 'skipped', seq: seq++ };
+  }
+
   for (const t of timeline) {
+    const live = t >= start;
+    // lessons whose outcome is known by now go into memory, oldest first
+    if (LEARN && waiting.length) {
+      const ready = [];
+      for (let k = waiting.length - 1; k >= 0; k--) if (waiting[k].tRes <= t) { ready.push(waiting[k]); waiting.splice(k, 1); }
+      ready.sort((a, b) => a.tRes - b.tRes || a.seq - b.seq).forEach(o => learn(L, o));
+    }
     for (const s of syms) {
       const p = preps[s];
       const i = p.idx.get(t);
       if (i === undefined) continue;
+      if (!live) { // warm-up: watch and learn, no trading
+        const hit = scan(p, i, S, scanStates[s]);
+        if (hit) { if (ANALYST) hit.ana = analyze(p, i, hit, S); const o = observe(s, p, i, t, hit); if (o) waiting.push(o); }
+        lastClose[s] = p.c[i];
+        continue;
+      }
 
       // 1) fill the signal from the previous bar at this bar's open
       const sig = pending.get(s);
@@ -146,10 +201,14 @@ export function runSimulation({ data, settings, start, end, capital }) {
       const hit = scan(p, i, S, scanStates[s]);
       if (hit) {
         signals++;
+        if (ANALYST) hit.ana = analyze(p, i, hit, S);
         sigList.push({ s, i, t, hit });
-        if (!open.has(s) && t + BAR_MS < end) pending.set(s, { ...hit, time: t });
+        const obs = LEARN || ANALYST ? observe(s, p, i, t, hit) : null;
+        if (obs) { observed.push(obs); if (LEARN) waiting.push(obs); }
+        if (!open.has(s) && t + BAR_MS < end) pending.set(s, { ...hit, time: t, obs });
       }
     }
+    if (!live) continue;
     const e = equityNow();
     if (e > peak) peak = e;
     const dd = (peak - e) / peak * 100;
@@ -158,7 +217,19 @@ export function runSimulation({ data, settings, start, end, capital }) {
   }
 
   const lastT = timeline.length ? timeline[timeline.length - 1] + BAR_MS : start;
+  // how the decisions turned out: trades taken vs. signals the analyst or the memory refused
+  let decisions = null;
+  if (ANALYST) {
+    decisions = {};
+    for (const o of observed) {
+      if (o.tRes > lastT) continue;
+      const d = decisions[o.dec] ??= { n: 0, sumR: 0, wins: 0 };
+      d.n++; d.sumR += o.R; if (o.R > 0) d.wins++;
+    }
+  }
+  const learnSummary = LEARN ? summary(L, Object.keys(S.strategies).filter(k => S.strategies[k]), [...new Set(syms.map(s => assetBySymbol[s]?.group))]) : null;
   return {
+    analyst: ANALYST, learn: learnSummary, decisions,
     start, end, lastTime: lastT, capital: startCap, cash, feesTotal, maxDD, maxDDusd, signals,
     closed, open: [...open.values()], equity, events, blocked, lastClose,
     symbols: syms, bars: timeline.length,

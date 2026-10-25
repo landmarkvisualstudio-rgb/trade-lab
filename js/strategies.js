@@ -29,15 +29,43 @@ export function prepare(series) {
     macd: macd(c), st: supertrend(h, l, c, 10, 3), vw: vwapDaily(t, h, l, c, v),
     bbU, bbL, bw, hiH55: priorMax(h, 55), loL55: priorMin(l, 55),
     lowIdx, highIdx, pk: piv.k,
+    // for the analyst: hourly trend, trend efficiency, room to the 100-bar extremes
+    ...hourlyEma(t, c, 20), er20: effRatio(c, 20), hiH100: priorMax(h, 100), loL100: priorMin(l, 100),
   };
   cache.set(series, p);
   return p;
 }
 
+// EMA of hourly closes (built from the 5-minute bars), known only once the hour closed
+function hourlyEma(t, c, n) {
+  const htf = new Array(c.length).fill(NaN), htfSlope = new Array(c.length).fill(NaN);
+  const k = 2 / (n + 1), hist = [];
+  let e = NaN, cnt = 0, sum = 0;
+  for (let i = 0; i < c.length; i++) {
+    if ((t[i] + BAR_MS) % 3600000 === 0) {
+      cnt++;
+      if (cnt <= n) { sum += c[i]; if (cnt === n) e = sum / n; } else e = c[i] * k + e * (1 - k);
+      if (!isNaN(e)) hist.push(e);
+    }
+    htf[i] = e;
+    htfSlope[i] = hist.length > 3 ? e - hist[hist.length - 4] : NaN;
+  }
+  return { htf, htfSlope };
+}
+// Kaufman efficiency ratio: 1 = straight trend, 0 = pure chop
+function effRatio(c, n) {
+  const out = new Array(c.length).fill(NaN);
+  for (let i = n; i < c.length; i++) {
+    let path = 0; for (let j = i - n + 1; j <= i; j++) path += Math.abs(c[j] - c[j - 1]);
+    out[i] = path > 0 ? Math.abs(c[i] - c[i - n]) / path : 0;
+  }
+  return out;
+}
+
 function minOf(a, from, to) { let m = Infinity; for (let j = Math.max(0, from); j <= to; j++) if (a[j] < m) m = a[j]; return m; }
 function maxOf(a, from, to) { let m = -Infinity; for (let j = Math.max(0, from); j <= to; j++) if (a[j] > m) m = a[j]; return m; }
 // confirmed pivots up to bar i (a pivot at j is known at j + k)
-function lastPivots(arr, i, k, n) {
+export function lastPivots(arr, i, k, n) {
   let lo = 0, hi = arr.length - 1, pos = -1;
   while (lo <= hi) { const m = (lo + hi) >> 1; if (arr[m] <= i - k) { pos = m; lo = m + 1; } else hi = m - 1; }
   return pos < 0 ? [] : arr.slice(Math.max(0, pos - n + 1), pos + 1);
@@ -251,17 +279,20 @@ function turtle(p, i, dir) {
 const FNS = { orb, breakout, flag, reclaim, bounce, ema_cross: emaCross, supertrend: superTrend, macd: macdCross, bb_squeeze: bbSqueeze, vwap_reclaim: vwapReclaim, vwap_dev: vwapDev, rsi_div: rsiDiv, engulfing, structure, turtle };
 
 // Every bar is scanned by every setup (so one-per-session state stays right); the
-// first enabled hit wins.
+// first enabled hit wins. hit.agree counts the other enabled setups that fired the
+// same way on this bar (the analyst uses it as confluence).
 export function scan(p, i, settings, state) {
   const dirs = settings.allowShort ? [1, -1] : [1];
   let hit = null;
+  const fired = [];
   for (const key of Object.keys(FNS)) {
     if (settings.strategies[key] === false && key !== 'orb') continue;
     for (const d of dirs) {
       const s = FNS[key](p, i, d, state);
-      if (s && settings.strategies[key] && !hit) hit = s;
+      if (s && settings.strategies[key]) { fired.push(s); if (!hit) hit = s; }
     }
   }
+  if (hit) hit.agree = fired.filter(s => s !== hit && s.dir === hit.dir).map(s => s.setup);
   return hit;
 }
 
