@@ -377,3 +377,10 @@ details.grp summary::-webkit-details-marker { display: none; }
 @media (max-width: 420px) { .tc-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .ntf-row { grid-template-columns: minmax(0, 1fr); } }
 #ntName { direction: rtl; text-align: right; }
 .ntf .chips { flex-wrap: wrap; overflow: visible; }
+
+/* ---------- analyst & experience ---------- */
+.ana-line { white-space: normal !important; line-height: 1.8; }
+.grade { display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 6px; font-size: 11px; font-weight: 800; color: #fff; margin-inline-end: 4px; vertical-align: -3px; }
+.grade.gA { background: var(--up); } .grade.gB { background: #4c8dff; } .grade.gC { background: #8a93a8; } .grade.gD { background: var(--down); }
+.tag.brain { font-size: 10.5px; padding: 1px 7px; }
+.ntf-brain { font-size: 12px; line-height: 1.8; margin-top: 6px; }
