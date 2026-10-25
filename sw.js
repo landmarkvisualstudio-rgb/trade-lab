@@ -1,5 +1,5 @@
 // Offline shell: the app works without a connection; market data always comes live.
-const VERSION = 'tradelab-v4';
+const VERSION = 'tradelab-v5';
 const SHELL = ['./', 'index.html', 'css/app.css', 'manifest.webmanifest',
   'js/app.js', 'js/config.js', 'js/engine.js', 'js/strategies.js', 'js/indicators.js', 'js/timemachine.js',
   'js/data.js', 'js/store.js', 'js/chart.js', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/favicon.svg', 'js/demo.js'];
