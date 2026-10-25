@@ -1,5 +1,5 @@
 import { ASSETS, GROUPS, STRATEGIES, DEFAULT_SETTINGS, BAR_MS, WARMUP_BARS, assetBySymbol } from './config.js';
-import { runSimulation, closeAllAtEnd, computeStats, BLOCK_REASONS } from './engine.js';
+import { runSimulation, closeAllAtEnd, computeStats, signalStats, BLOCK_REASONS } from './engine.js';
 import { ensureHistory, klines, tickers, liveStream, pool, unavailable, netState, toSeries, mode, probe } from './data.js';
 import { createCandleChart, createAreaChart, priceDecimals, sparkPath } from './chart.js';
 import { prepare } from './strategies.js';
@@ -17,7 +17,7 @@ const S = {
   live: load('live', { status: 'idle' }),      // {status, start, end, settings}
   liveRes: null, liveStats: null, liveLoading: null, liveError: '',
   prices: {}, t24: {}, sparks: {},
-  page: location.hash.slice(1) || 'dash', detail: null, tf: '15m',
+  page: ['dash', 'market', 'trades', 'backtest', 'settings'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'dash', detail: null, tf: '15m',
   bt: { res: load('bt', null), running: null, days: load('btDays', 7), error: '' },
   filter: 'all', search: '', tradesTab: 'closed', tradesSrc: 'live',
   installEvt: null, seenEvents: load('seenEvents', 0), offline: false,
@@ -148,8 +148,8 @@ function shade(hex) { const n = parseInt(hex.slice(1), 16); const f = v => Math.
 function kpiTiles(st, extra = {}) {
   const pf = st.profitFactor === Infinity ? '∞' : nf(st.profitFactor, 2);
   return `<div class="kpis">
-    <div class="kpi glass flat"><div class="k">تعداد معاملات</div><div class="v num">${st.n}</div><div class="s">${st.wins} برد · ${st.losses} باخت</div></div>
-    <div class="kpi glass flat"><div class="k">نرخ برد</div><div class="v num">${nf(st.winRate, 1)}%</div><div class="s">سربه‌سر با هدف ${S.settings.targetR}R: ${nf(100 / (1 + S.settings.targetR), 0)}%</div></div>
+    <div class="kpi glass flat"><div class="k">معاملات بسته / باز</div><div class="v num">${st.n} <span class="muted" style="font-size:15px">/ ${st.openCount}</span></div><div class="s">${st.wins} برد · ${st.losses} باخت</div></div>
+    <div class="kpi glass flat"><div class="k">نرخ برد</div><div class="v num">${nf(st.winRate, 1)}%</div><div class="s">${st.n ? `سربه‌سر با هدف ${extra.R || S.settings.targetR}R: ${nf(100 / (1 + (extra.R || S.settings.targetR)), 0)}%` : 'بعد از بسته شدن معامله‌ها'}</div></div>
     <div class="kpi glass flat"><div class="k">فاکتور سود</div><div class="v num ${st.profitFactor >= 1 ? 'up' : st.n ? 'down' : ''}">${pf}</div><div class="s">سود کل ÷ زیان کل</div></div>
     <div class="kpi glass flat"><div class="k">میانگین هر معامله</div><div class="v num ${cls(st.avgR)}">${signed(st.avgR, 2)}R</div><div class="s">R = ریسک هر معامله</div></div>
     <div class="kpi glass flat"><div class="k">بیشترین افت حساب</div><div class="v num down">${nf(st.maxDD, 2)}%</div><div class="s num">${nf(st.maxDDusd)} USDT</div></div>
@@ -163,7 +163,7 @@ function verdictCard(st, bench) {
   let kind = 'mid', icon = '…', title, text;
   if (st.n < 30) {
     title = 'هنوز نمونه کافی نیست';
-    text = `${st.n} معامله بسته شده. برای قضاوت منصفانه حداقل ۳۰ تا ۱۰۰ معامله لازم است؛ با یک هفته تست پرفشار به این عدد می‌رسیم.`;
+    text = `${st.n} معامله بسته شده${st.openCount ? ` و ${st.openCount} معامله باز است` : ''}. برای قضاوت منصفانه حداقل ۳۰ تا ۱۰۰ معامله لازم است. برای رسیدن سریع‌تر به این عدد، پروفایل «پرفشار» را امتحان کنید و «نرخ درستی سیگنال‌ها» را ببینید که از همان ساعت اول نتیجه می‌دهد.`;
   } else if (st.profitFactor >= 1.3 && st.pnl > 0) {
     kind = 'good'; icon = '↑'; title = 'تا اینجا سودده است';
     text = `فاکتور سود ${nf(st.profitFactor)} و میانگین ${signed(st.avgR)}R بعد از کارمزد. نتیجه‌ی یک هفته هنوز می‌تواند شانسی باشد.`;
@@ -288,7 +288,7 @@ function startLive() {
   S.live = { status: 'running', start, end: start + S.settings.testDays * DAY, settings: JSON.parse(JSON.stringify(S.settings)) };
   save('live', S.live); S.seenEvents = 0; save('seenEvents', 0);
   S.liveRes = null; lastRefreshBar = 0;
-  toast('تست شروع شد. ربات از کندل ۵ دقیقه‌ای بعدی معامله می‌کند.');
+  toast(`تست ${durLabel(S.settings.testDays)} شروع شد. ربات از کندل ۵ دقیقه‌ای بعدی معامله می‌کند.`);
   if (S.settings.notifications && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission();
   render(); refreshLive(true);
 }
@@ -317,6 +317,110 @@ function confirmBox(msg, okText = 'تأیید') {
   });
 }
 
+/* ---------------- durations & profiles ---------------- */
+const DURATIONS = [[1 / 24, '۱ ساعت'], [4 / 24, '۴ ساعت'], [0.5, '۱۲ ساعت'], [1, '۱ روز'], [3, '۳ روز'], [7, '۷ روز']];
+const durLabel = d => (DURATIONS.find(x => Math.abs(x[0] - d) < 1e-6) || [d, d >= 1 ? `${+d.toFixed(2)} روز` : `${Math.round(d * 24)} ساعت`])[1];
+// «پرفشار» forces many short trades so accuracy can be measured fast
+const PROFILES = {
+  standard: { name: 'استاندارد', desc: 'هدف ۲R، نگه‌داری تا ۴ ساعت، ریسک ۱٪', set: { targetR: 2, maxHoldHours: 4, riskPct: 1, maxPositionPct: 30, maxOpen: 6, cooldownBars: 6, maxTradesPerDay: 60, dailyLossPct: 6 } },
+  stress: { name: 'پرفشار', desc: 'هدف ۱.۵R، نگه‌داری تا ۱ ساعت، ریسک ۰.۵٪، تا ۱۲ پوزیشن هم‌زمان', set: { targetR: 1.5, maxHoldHours: 1, riskPct: 0.5, maxPositionPct: 12, maxOpen: 12, cooldownBars: 2, maxTradesPerDay: 300, dailyLossPct: 10 } },
+};
+const activeProfile = st => Object.keys(PROFILES).find(k => Object.entries(PROFILES[k].set).every(([f, v]) => st[f] === v)) || 'custom';
+function applyProfile(k) { Object.assign(S.settings, PROFILES[k].set); save('settings', S.settings); }
+
+/* ---------------- device sync ---------------- */
+// The robot is deterministic: the same start time and settings give the same
+// trades on any device. A sync link carries just those.
+function settingsDiff(st) {
+  const d = {};
+  for (const [k, v] of Object.entries(st)) {
+    if (k === 'strategies' || k === 'symbols') {
+      const sub = {}; for (const [kk, vv] of Object.entries(v)) if (DEFAULT_SETTINGS[k][kk] !== vv) sub[kk] = vv;
+      if (Object.keys(sub).length) d[k] = sub;
+    } else if (DEFAULT_SETTINGS[k] !== v) d[k] = v;
+  }
+  return d;
+}
+const b64u = str => btoa(unescape(encodeURIComponent(str))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64u = str => decodeURIComponent(escape(atob(str.replace(/-/g, '+').replace(/_/g, '/'))));
+function syncLink() {
+  const L = S.live;
+  const payload = { v: 1, s: L.start, e: L.end, d: settingsDiff(L.settings), m: mode.demo ? 1 : 0 };
+  return location.origin + location.pathname + '#join=' + b64u(JSON.stringify(payload));
+}
+async function handleJoin() {
+  const m = location.hash.match(/^#join=([\w-]+)/);
+  if (!m) return false;
+  history.replaceState(null, '', location.pathname + '#dash');
+  S.page = 'dash'; S.detail = null;
+  let p;
+  try { p = JSON.parse(unb64u(m[1])); } catch { toast('لینک همگام‌سازی معتبر نیست'); return false; }
+  if (!!p.m !== mode.demo) { save('demo', !!p.m); save('pendingJoin', m[1]); location.reload(); return true; }
+  const settings = mergeSettings(p.d || {});
+  const same = S.live && S.live.start === p.s && S.live.end === p.e;
+  if (!same && S.live.status !== 'idle' && !(await confirmBox('روی این دستگاه یک تست دیگر هست. با تست دستگاه دیگر جایگزین شود؟', 'جایگزین کن'))) return false;
+  S.live = { status: Date.now() >= p.e ? 'done' : 'running', start: p.s, end: p.e, settings };
+  save('live', S.live); S.seenEvents = 0; save('seenEvents', 0); S.liveRes = null; lastRefreshBar = 0;
+  toast('همگام شد: همان تست دستگاه دیگر روی این دستگاه باز است.');
+  render(); refreshLive(true);
+  return true;
+}
+let qrLib = null;
+function loadQR() {
+  if (qrLib) return qrLib;
+  qrLib = new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js'; sc.onload = () => res(window.qrcode); sc.onerror = rej; document.head.appendChild(sc); });
+  return qrLib;
+}
+async function showSync() {
+  const link = syncLink();
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-wrap';
+  wrap.innerHTML = `<div class="modal glass sync-modal" role="dialog" aria-modal="true">
+    <p style="margin-bottom:8px">همگام‌سازی با دستگاه دیگر</p>
+    <div class="muted" style="font-size:13px;line-height:1.9;margin-bottom:12px">این کد را با دوربین گوشی اسکن کنید یا لینک را روی دستگاه دیگر باز کنید. همان تست با همان زمان شروع و همان تنظیمات آنجا باز می‌شود و چون ربات از روی کندل‌های واقعی حساب می‌کند، معامله‌ها روی هر دو دستگاه یکی است.</div>
+    <div class="qr" id="qrBox"><span class="loader"></span></div>
+    <input class="input sync-link" readonly value="${esc(link)}" id="syncLink">
+    <div class="acts" style="margin-top:12px"><button class="btn primary" data-copy>کپی لینک</button><button class="btn" data-close>بستن</button></div></div>`;
+  const close = () => wrap.remove();
+  wrap.addEventListener('click', e => { if (e.target === wrap) close(); });
+  wrap.querySelector('[data-close]').onclick = close;
+  wrap.querySelector('[data-copy]').onclick = async () => {
+    const inp = wrap.querySelector('#syncLink');
+    try { await navigator.clipboard.writeText(link); toast('لینک کپی شد'); } catch { inp.select(); document.execCommand?.('copy'); toast('لینک را انتخاب و کپی کنید'); }
+  };
+  document.body.appendChild(wrap);
+  try {
+    const qrcode = await loadQR();
+    const q = qrcode(0, 'M'); q.addData(link); q.make();
+    wrap.querySelector('#qrBox').innerHTML = q.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+  } catch { wrap.querySelector('#qrBox').innerHTML = '<div class="muted" style="font-size:12px">کد QR بارگذاری نشد؛ از لینک استفاده کنید.</div>'; }
+}
+
+/* ---------------- signal accuracy ---------------- */
+function accuracyCard(res) {
+  if (!res?.sigEval) return '';
+  const ss = signalStats(res.sigEval);
+  const T = ss.total;
+  const be = 100 / (1 + (res.targetR || S.settings.targetR));
+  const rows = Object.entries(STRATEGIES).map(([k, st]) => {
+    const b = ss.bySetup[k];
+    if (!b || !b.n) return `<div class="bar-row"><div><b style="font-weight:600">${st.name}</b><div class="muted" style="font-size:11.5px">بدون سیگنال</div></div><div class="bar-track"></div><div class="num muted" style="min-width:70px;text-align:left">—</div></div>`;
+    const acc = b.accuracy, good = acc >= be;
+    return `<div class="bar-row"><div><b style="font-weight:600">${st.name}</b><div class="muted" style="font-size:11.5px">${b.done} نتیجه از ${b.n} سیگنال · هدف ${b.target} / ضرر ${b.stop}</div></div>
+      <div class="bar-track"><div style="right:0;width:${Math.min(100, acc)}%;background:var(--${good ? 'up' : 'down'})"></div><span class="mid" style="right:${be}%"></span></div>
+      <div class="num ${good ? 'up' : 'down'}" style="font-weight:700;min-width:70px;text-align:left">${nf(acc, 0)}% <span class="muted" style="font-weight:500;font-size:11px">${signed(b.avgR, 2)}R</span></div></div>`;
+  }).join('');
+  return `<div class="card glass"><h3>نرخ درستی سیگنال‌ها <span class="muted">همه‌ی سیگنال‌ها، حتی آن‌هایی که معامله نشدند</span></h3>
+    <div class="kpis" style="margin-bottom:14px">
+      <div class="kpi glass flat"><div class="k">سیگنال بررسی‌شده</div><div class="v num">${T.done}</div><div class="s">${T.pending} در انتظار نتیجه</div></div>
+      <div class="kpi glass flat"><div class="k">نرخ درستی کل</div><div class="v num ${T.accuracy >= be ? 'up' : 'down'}">${nf(T.accuracy, 1)}%</div><div class="s">سربه‌سر: ${nf(be, 0)}%</div></div>
+      <div class="kpi glass flat"><div class="k">به هدف رسید / به ضرر</div><div class="v num"><span class="up">${T.target}</span> / <span class="down">${T.stop}</span></div><div class="s">${T.time} با پایان زمان</div></div>
+      <div class="kpi glass flat"><div class="k">میانگین هر سیگنال</div><div class="v num ${cls(T.avgR)}">${signed(T.avgR, 2)}R</div><div class="s">قبل از کارمزد</div></div>
+    </div>
+    <div class="bars">${rows}</div>
+    <p class="muted" style="font-size:12px;margin:12px 0 0;line-height:1.9">«نرخ درستی» یعنی از سیگنال‌هایی که به هدف یا حد ضرر رسیدند، چند درصد اول به هدف رسیدند. خط عمودی نقطه‌ی سربه‌سر است: با هدف ${res.targetR || S.settings.targetR}R، درستی بالای ${nf(be, 0)}% یعنی آن مهارت در این بازه سودده بوده.</p></div>`;
+}
+
 /* ---------------- offline / demo ---------------- */
 function setDemo(on) { save('demo', on); location.reload(); }
 function offlineCard() {
@@ -337,22 +441,27 @@ function pageDash(main) {
           <div class="hero-top"><span class="status"><span class="dot"></span> آماده‌ی شروع</span></div>
           <div class="label" style="margin-top:14px">سرمایه‌ی مجازی</div>
           <div class="equity num">${nf(S.settings.capital, 0)}<small>USDT</small></div>
-          <p class="muted" style="margin:6px 0 0;max-width:560px">ربات با پول مجازی و روی قیمت واقعی بازار، به‌صورت خودکار معامله می‌کند: اسکنر ستاپ پیدا می‌کند، برنامه‌ی خروج حد ضرر و هدف را می‌گذارد، مدیر بودجه حجم را تعیین می‌کند و مدیر ریسک معامله‌های پرخطر را رد می‌کند. بعد از ${S.settings.testDays} روز معلوم می‌شود این سیستم چقدر سود یا ضرر داده است.</p>
+          <p class="muted" style="margin:6px 0 0;max-width:560px">ربات با پول مجازی و روی قیمت واقعی بازار، به‌صورت خودکار معامله می‌کند: اسکنر ستاپ پیدا می‌کند، برنامه‌ی خروج حد ضرر و هدف را می‌گذارد، مدیر بودجه حجم را تعیین می‌کند و مدیر ریسک معامله‌های پرخطر را رد می‌کند. بعد از ${durLabel(S.settings.testDays)} معلوم می‌شود این سیستم چقدر سود یا ضرر داده است.</p>
+          <div class="pick"><div class="pick-l">مدت تست</div><div class="chips">${DURATIONS.map(([d, n]) => `<button class="chip ${Math.abs(S.settings.testDays - d) < 1e-6 ? 'active' : ''}" data-dur="${d}">${n}</button>`).join('')}</div></div>
+          <div class="pick"><div class="pick-l">پروفایل</div><div class="chips">${Object.entries(PROFILES).map(([k, pr]) => `<button class="chip ${activeProfile(S.settings) === k ? 'active' : ''}" data-prof="${k}">${pr.name}</button>`).join('')}${activeProfile(S.settings) === 'custom' ? '<button class="chip active">سفارشی</button>' : ''}</div></div>
+          <div class="muted" style="font-size:12.5px;margin-top:6px">${activeProfile(S.settings) === 'custom' ? 'تنظیمات دستی از صفحه‌ی تنظیمات' : PROFILES[activeProfile(S.settings)].desc}</div>
           <div class="hero-actions">
-            <button class="btn primary" id="startBtn">${I.play} شروع تست ${S.settings.testDays} روزه</button>
+            <button class="btn primary" id="startBtn">${I.play} شروع تست ${durLabel(S.settings.testDays)}</button>
             <button class="btn" data-go2="backtest">${I.backtest} اول یک بک‌تست سریع</button>
           </div>
         </div>
         <div class="card glass">
           <h3>چطور کار می‌کند</h3>
           <div class="list">
-            ${[['۱', 'اسکنر', '۵ ستاپ روی کندل‌های ۵ دقیقه‌ای ۱۷ دارایی'], ['۲', 'ورود', 'فقط بعد از بسته شدن کندل؛ با قیمت باز کندل بعد'], ['۳', 'خروج', `حد ضرر قبل از ورود، هدف ${S.settings.targetR}R، حداکثر ${S.settings.maxHoldHours} ساعت`], ['۴', 'بودجه و ریسک', `ریسک هر معامله ${S.settings.riskPct}% و حد ضرر روزانه ${S.settings.dailyLossPct}%`], ['۵', 'کارمزد واقعی', `کارمزد ${S.settings.feeSpotPct}% و لغزش ${S.settings.slippagePct}% در هر معامله کم می‌شود`]]
+            ${[['۱', 'اسکنر', '۵ ستاپ روی کندل‌های ۵ دقیقه‌ای ۱۷ دارایی'], ['۲', 'ورود', 'فقط بعد از بسته شدن کندل؛ با قیمت باز کندل بعد'], ['۳', 'خروج', `حد ضرر قبل از ورود، هدف ${S.settings.targetR}R، حداکثر ${S.settings.maxHoldHours} ساعت`], ['۴', 'بودجه و ریسک', `ریسک هر معامله ${S.settings.riskPct}% و حد ضرر روزانه ${S.settings.dailyLossPct}%`], ['۵', 'کارمزد واقعی', `کارمزد ${S.settings.feeSpotPct}% و لغزش ${S.settings.slippagePct}% در هر معامله کم می‌شود`], ['۶', 'همگام‌سازی', 'بعد از شروع، با دکمه‌ی «همگام‌سازی» همان تست را روی گوشی یا لپ‌تاپ دیگر باز کنید']]
               .map(([n, a, b]) => `<div class="row"><span class="coin" style="background:linear-gradient(145deg,#2c4fb0,#0a1838)">${n}</span><div class="main"><div class="t1">${a}</div><div class="t2" style="white-space:normal">${b}</div></div></div>`).join('')}
           </div>
           <p class="note" style="margin:12px 0 0">اگر اپ را ببندید ربات متوقف نمی‌شود: با باز کردن دوباره، کندل‌های جاافتاده از Binance گرفته و دقیقاً همان معامله‌ها بازسازی می‌شوند.</p>
         </div>
       </div></div>`;
     $('#startBtn').onclick = startLive;
+    main.querySelectorAll('[data-dur]').forEach(b => b.onclick = () => { S.settings.testDays = +b.dataset.dur; save('settings', S.settings); render(); });
+    main.querySelectorAll('[data-prof]').forEach(b => b.onclick = () => { applyProfile(b.dataset.prof); render(); });
     main.querySelector('[data-go2]').onclick = () => go('backtest');
     return;
   }
@@ -378,15 +487,17 @@ function pageDash(main) {
         <div class="pnl-row" id="pnlRow">${st ? pnlPills(st, L.settings.capital) : ''}</div>
         <div class="subrow"><span>سود قطعی: <b class="num ${cls(st?.realized)}">${st ? signed(st.realized) : '—'}</b></span><span>سود شناور: <b class="num ${cls(st?.unrealized)}" id="unrealVal">${st ? signed(st.unrealized) : '—'}</b></span><span>سرمایه‌ی اولیه: <b class="num">${nf(L.settings.capital, 0)}</b></span></div>
         <div class="progress"><div style="width:${prog}%"></div></div>
-        <div class="progress-meta"><span>${jD.format(new Date(L.start))}</span><span>${done ? 'پایان: ' + jD.format(new Date(L.end)) : 'باقی‌مانده: ' + dur(L.end - now)}</span></div>
+        <div class="progress-meta"><span>${jD.format(new Date(L.start))} · ${durLabel(L.settings.testDays)}</span><span>${done ? 'پایان: ' + jD.format(new Date(L.end)) : 'باقی‌مانده: ' + dur(L.end - now)}</span></div>
         <div class="hero-actions">
           <button class="btn sm" id="refreshBtn">${I.refresh} به‌روزرسانی</button>
+          <button class="btn sm" id="syncBtn">${I.install} همگام‌سازی دستگاه‌ها</button>
           ${done ? `<button class="btn sm primary" id="newBtn">${I.play} تست تازه</button>` : `<button class="btn sm danger" id="stopBtn">${I.stop} پایان زودهنگام</button>`}
           ${done ? '' : `<button class="btn sm" id="resetBtn">شروع دوباره</button>`}
         </div>
       </div>
       ${st ? verdictCard(st, bench) : '<div class="card glass"><div class="empty"><span class="loader"></span><br>در حال ساخت نتیجه از کندل‌های بازار…</div></div>'}
-      <div class="span-2">${st ? kpiTiles(st, { k: 'سیگنال اسکنر', v: res?.signals ?? '—', s: `${st.openCount} پوزیشن باز` }) : ''}</div>
+      <div class="span-2">${st ? kpiTiles(st, { k: 'سیگنال اسکنر', v: res?.signals ?? '—', s: `${durLabel(L.settings.testDays)} · ${PROFILES[activeProfile(L.settings)]?.name || 'سفارشی'}`, R: L.settings.targetR }) : ''}</div>
+      ${res ? `<div class="span-2">${accuracyCard({ ...res, targetR: L.settings.targetR })}</div>` : ''}
       <div class="card glass span-2"><h3>منحنی سرمایه <span class="muted">هر نقطه = بسته شدن یک کندل ۵ دقیقه‌ای</span></h3><div class="chart-box" id="eqChart"></div></div>
       <div class="card glass"><h3>پوزیشن‌های باز <span class="muted">قیمت زنده</span></h3><div class="list" id="openList">${openList()}</div></div>
       <div class="card glass"><h3>آخرین معاملات <span class="muted"><a href="#trades">همه</a></span></h3><div class="list">${res && res.closed.length ? res.closed.slice(-6).reverse().map(x => tradeRow(x)).join('') : '<div class="empty">هنوز معامله‌ای بسته نشده</div>'}</div></div>
@@ -397,6 +508,7 @@ function pageDash(main) {
   charts.push(eq);
   eq.setData(res ? thin(res.equity, 600).concat(res.equity.length ? [[Date.now(), st.equity]] : []) : snap?.equity || [], L.settings.capital);
   $('#refreshBtn').onclick = () => refreshLive(true);
+  $('#syncBtn').onclick = showSync;
   $('#stopBtn') && ($('#stopBtn').onclick = stopLive);
   $('#resetBtn') && ($('#resetBtn').onclick = resetLive);
   $('#newBtn') && ($('#newBtn').onclick = () => { S.live = { status: 'idle' }; save('live', S.live); render(); });
@@ -605,7 +717,7 @@ function pageBacktest(main) {
       <div class="label">تست سریع روی گذشته</div>
       <p class="muted" style="margin:4px 0 12px">همان ربات و همان قوانین تنظیمات، روی کندل‌های واقعی چند روز گذشته اجرا می‌شود و در چند ثانیه نتیجه می‌دهد. از ${nf(S.settings.capital, 0)} تتر مجازی شروع می‌کند.</p>
       <div class="toolbar" style="margin:0">
-        <div class="seg">${[3, 7, 14, 30].map(d => `<button data-days="${d}" class="${B.days === d ? 'active' : ''}">${d} روز</button>`).join('')}</div>
+        <div class="seg">${[1, 3, 7, 14, 30].map(d => `<button data-days="${d}" class="${B.days === d ? 'active' : ''}">${d} روز</button>`).join('')}</div>
         <button class="btn primary" id="runBt" ${B.running ? 'disabled' : ''}>${B.running ? `<span class="loader"></span> ${B.running}` : `${I.play} اجرا`}</button>
       </div>
       ${B.error ? `<div class="note warn" style="margin-top:12px">${B.error}</div>` : ''}
@@ -622,6 +734,7 @@ function pageBacktest(main) {
       ${verdictCard(st, res.bench)}
       <div class="span-2">${kpiTiles(st, { k: 'بهترین / بدترین', v: `<span class="up">${signed(st.best?.pnl || 0)}</span> / <span class="down">${signed(st.worst?.pnl || 0)}</span>`, s: 'USDT در یک معامله' })}</div>
       <div class="card glass span-2"><h3>منحنی سرمایه</h3><div class="chart-box" id="btChart"></div></div>
+      <div class="span-2">${accuracyCard(res)}</div>
       <div class="span-2 grid cols-2">${breakdown(st)}</div>
       <div class="span-2">${blockedCard(res)}</div>
       <div class="card glass span-2"><h3>آخرین معاملات بک‌تست <span class="muted"><a href="#trades" id="btAll">همه</a></span></h3><div class="list">${res.closed.slice(-10).reverse().map(x => tradeRow(x)).join('') || '<div class="empty">در این بازه معامله‌ای انجام نشد</div>'}</div></div>
@@ -654,6 +767,7 @@ async function runBacktest() {
   const res = closeAllAtEnd(runSimulation({ data, settings: S.settings, start, end }), S.settings);
   res.bench = benchmark(res, data);
   res.days = B.days;
+  res.targetR = S.settings.targetR;
   res.equity = thin(res.equity, 800);
   res.events = [];
   B.res = res; B.running = null;
@@ -677,7 +791,9 @@ function pageSettings(main) {
       </div>
       <div class="card glass"><h3>سرمایه و دوره‌ی تست</h3>
         ${num('capital', 'سرمایه‌ی مجازی (USDT)', 'پیش‌فرض ۱۰۰۰ تتر', 1, 10)}
-        ${num('testDays', 'مدت تست زنده (روز)', 'تست پرفشار: ۷ روز', 1, 1, 60)}
+        <div class="field"><div class="lbl"><b>مدت تست زنده</b><span>کوتاه‌تر = نتیجه‌ی سریع‌تر</span></div></div>
+        <div class="chips" style="flex-wrap:wrap;margin:-4px 0 8px">${DURATIONS.map(([d, n]) => `<button class="chip ${Math.abs(st.testDays - d) < 1e-6 ? 'active' : ''}" data-dur="${d}">${n}</button>`).join('')}</div>
+        <div class="field"><div class="lbl"><b>پروفایل</b><span>${activeProfile(st) === 'custom' ? 'سفارشی' : PROFILES[activeProfile(st)].desc}</span></div><div class="seg">${Object.entries(PROFILES).map(([k, pr]) => `<button data-prof="${k}" class="${activeProfile(st) === k ? 'active' : ''}">${pr.name}</button>`).join('')}</div></div>
         ${num('maxHoldHours', 'حداکثر نگه‌داری (ساعت)', 'بازار ۲۴ ساعته زنگ بسته شدن ندارد؛ بعد از این مدت پوزیشن بسته می‌شود', 0.5, 0.5, 72)}
       </div>
       <div class="card glass"><h3>مدیر بودجه و ریسک <span class="muted">trader-budget / trader-risk</span></h3>
@@ -726,6 +842,8 @@ function pageSettings(main) {
   main.querySelectorAll('input[data-strat]').forEach(inp => inp.onchange = () => { S.settings.strategies[inp.dataset.strat] = inp.checked; persist(); });
   main.querySelectorAll('input[data-sym-t]').forEach(inp => inp.onchange = () => { S.settings.symbols[inp.dataset.symT] = inp.checked; persist(); });
   main.querySelectorAll('[data-theme]').forEach(b => b.onclick = () => { S.theme = b.dataset.theme; applyTheme(); render(); });
+  main.querySelectorAll('[data-dur]').forEach(b => b.onclick = () => { S.settings.testDays = +b.dataset.dur; persist(); render(); });
+  main.querySelectorAll('[data-prof]').forEach(b => b.onclick = () => { applyProfile(b.dataset.prof); render(); toast('پروفایل ' + PROFILES[b.dataset.prof].name + ' اعمال شد'); });
   $('#installBtn').onclick = async () => { if (!S.installEvt) return; S.installEvt.prompt(); await S.installEvt.userChoice; S.installEvt = null; render(); };
   $('#defBtn').onclick = () => { S.settings = mergeSettings({}); persist(); render(); toast('تنظیمات پیش‌فرض برگشت'); };
   $('#wipeBtn').onclick = async () => {
@@ -750,6 +868,9 @@ document.fonts?.ready.then(() => charts.forEach(c => c.redraw && c.redraw()));
 
 let tickPending = false;
 async function boot() {
+  const pj = load('pendingJoin', null);
+  if (pj) { remove('pendingJoin'); history.replaceState(null, '', location.pathname + '#join=' + pj); }
+  if (await handleJoin()) { /* joined */ }
   if (!mode.demo && !(await probe())) { S.offline = true; render(); }
   try {
     S.t24 = await tickers(ASSETS.map(a => a.symbol));

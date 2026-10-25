@@ -329,3 +329,12 @@ a { color: inherit; }
 .offline-card .txt { flex: 1 1 260px; min-width: 0; }
 .offline-card b { display: block; font-size: 15px; margin-bottom: 2px; }
 .offline-card p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.9; }
+/* duration / profile pickers */
+.pick { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.pick-l { font-size: 12.5px; font-weight: 700; color: var(--muted); min-width: 52px; }
+.pick .chips { flex: 1; min-width: 0; }
+/* sync modal */
+.sync-modal { width: min(400px, 100%); }
+.qr { width: 220px; height: 220px; margin: 0 auto 12px; padding: 10px; border-radius: 18px; background: #fff; display: grid; place-items: center; color: #0b1a3d; }
+.qr svg { width: 100%; height: 100%; }
+.sync-link { width: 100%; text-align: left; font-weight: 500; font-size: 12px; }

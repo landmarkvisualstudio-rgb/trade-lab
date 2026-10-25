@@ -38,7 +38,7 @@ const memory = new Map();
 // demo mode keeps its own separate world of saved state
 let prefix = 'tl:';
 export function setDemoStorage(on) { prefix = on ? 'tl:demo:' : 'tl:'; }
-const GLOBAL = new Set(['theme', 'demo']);
+const GLOBAL = new Set(['theme', 'demo', 'pendingJoin']);
 const k = key => (GLOBAL.has(key) ? 'tl:' : prefix) + key;
 
 export function load(key, fallback) {

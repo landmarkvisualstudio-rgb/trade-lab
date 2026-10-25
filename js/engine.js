@@ -39,6 +39,7 @@ export function runSimulation({ data, settings, start, end, capital }) {
   const closed = [], equity = [], events = [], blocked = {};
   const perDay = new Map(); // dayKey -> {trades, realized}
   let nextId = 1, signals = 0;
+  const sigList = [];
   const day = t => { const k = dayKey(t); if (!perDay.has(k)) perDay.set(k, { trades: 0, realized: 0 }); return perDay.get(k); };
   const feePct = s => (assetBySymbol[s]?.market === 'futures' ? S.feeFuturesPct : S.feeSpotPct) / 100;
   const slip = S.slippagePct / 100;
@@ -145,6 +146,7 @@ export function runSimulation({ data, settings, start, end, capital }) {
       const hit = scan(p, i, S, scanStates[s]);
       if (hit) {
         signals++;
+        sigList.push({ s, i, t, hit });
         if (!open.has(s) && t + BAR_MS < end) pending.set(s, { ...hit, time: t });
       }
     }
@@ -160,6 +162,7 @@ export function runSimulation({ data, settings, start, end, capital }) {
     start, end, lastTime: lastT, capital: startCap, cash, feesTotal, maxDD, maxDDusd, signals,
     closed, open: [...open.values()], equity, events, blocked, lastClose,
     symbols: syms, bars: timeline.length,
+    sigEval: evaluateSignals(sigList, preps, S, maxHold, end),
   };
 }
 
@@ -219,4 +222,39 @@ export function computeStats(res, prices = {}) {
     bySetup: by('setup'), bySymbol: by('symbol'),
     byReason: by('reason'), openCount: res.open.length,
   };
+}
+
+// Signal accuracy: every scanner signal is checked on its own, as if taken with
+// the exit plan, whether or not the risk rules let the robot trade it. Entry at
+// the next bar's open, stop first on a bar that touches both (like trader-timemachine).
+export function evaluateSignals(list, preps, S, maxHold, end) {
+  const out = [];
+  for (const { s, i, t, hit } of list) {
+    const p = preps[s];
+    const j = i + 1;
+    if (j >= p.t.length || p.t[j] >= end) { out.push({ symbol: s, setup: hit.setup, t, outcome: 'pending' }); continue; }
+    const dir = hit.dir, entry = p.o[j], stop = hit.stop;
+    const risk = (entry - stop) * dir;
+    if (!(risk > 0) || risk / entry * 100 < S.minStopPct || risk / entry * 100 > S.maxStopPct) { out.push({ symbol: s, setup: hit.setup, t, outcome: 'invalid' }); continue; }
+    const target = entry + dir * S.targetR * risk;
+    let outcome = 'pending', R = 0;
+    for (let k = j; k < p.t.length && p.t[k] < end && k < j + maxHold; k++) {
+      if (dir > 0 ? p.l[k] <= stop : p.h[k] >= stop) { outcome = 'stop'; R = -1; break; }
+      if (dir > 0 ? p.h[k] >= target : p.l[k] <= target) { outcome = 'target'; R = S.targetR; break; }
+      if (k === j + maxHold - 1) { outcome = 'time'; R = (p.c[k] - entry) * dir / risk; }
+    }
+    out.push({ symbol: s, setup: hit.setup, t, outcome, R });
+  }
+  return out;
+}
+
+export function signalStats(sigEval) {
+  const by = {};
+  const tot = { n: 0, target: 0, stop: 0, time: 0, pending: 0, invalid: 0, sumR: 0 };
+  for (const e of sigEval || []) {
+    const b = by[e.setup] ??= { n: 0, target: 0, stop: 0, time: 0, pending: 0, invalid: 0, sumR: 0 };
+    for (const x of [b, tot]) { x.n++; x[e.outcome]++; if (e.outcome === 'target' || e.outcome === 'stop' || e.outcome === 'time') x.sumR += e.R; }
+  }
+  const fin = x => { const done = x.target + x.stop + x.time; return { ...x, done, accuracy: x.target + x.stop ? x.target / (x.target + x.stop) * 100 : 0, avgR: done ? x.sumR / done : 0 }; };
+  return { total: fin(tot), bySetup: Object.fromEntries(Object.entries(by).map(([k, v]) => [k, fin(v)])) };
 }
