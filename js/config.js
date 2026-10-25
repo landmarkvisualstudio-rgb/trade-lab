@@ -130,6 +130,7 @@ export const DEFAULT_SETTINGS = {
   learn: true,                // experience memory: learns from every resolved signal
   learnWarmDays: 3,           // days of history watched before the start, to begin with experience
   minScore: 0,                // analyst score needed while the memory is still young
+  maxCostR: 0.2,              // refuse a trade whose fees + slippage exceed this share of its risk
 };
 
 export const WARMUP_BARS = 300;

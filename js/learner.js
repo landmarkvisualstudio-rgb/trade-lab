@@ -4,31 +4,32 @@
 // net of fees and slippage, goes into memory. Before each new entry the memory is
 // asked: "what happened the last times I saw something like this?"
 //
-// - Recent experience counts more (each new lesson fades older ones a little).
+// - Recent experience counts more: a lesson's weight halves every 2 days of market time.
 // - Small samples are shrunk toward zero, so a few lucky trades don't fool it.
 // - A setup it gave up on is still watched, so it comes back if it starts working.
 // Everything is deterministic: the same candles give the same memory on any device.
 import { FACTORS } from './analyst.js';
 import { GROUPS } from './config.js';
 
-const FADE = 0.992;         // per lesson: ~85 lessons to halve an old one's weight
+const HALF_LIFE = 2 * 86400000; // a lesson's weight halves every 2 days of market time
 const SHRINK = 6;           // pseudo-lessons at 0R added to every estimate
 const READY = 25;           // lessons before the memory starts to decide
 export const LEARN_DEFAULTS = { avoidBelow: -0.12, boostAbove: 0.15, maxMult: 1.5, minMult: 0.5 };
 
-export function newLearner() { return { stats: {}, n: 0, lessons: 0, history: [] }; }
+export function newLearner() { return { stats: {}, n: 0, now: 0, lessons: 0, history: [] }; }
 
+const fade = (L, s) => Math.pow(0.5, Math.max(0, L.now - s.last) / HALF_LIFE);
 function bump(L, key, R) {
-  const s = L.stats[key] ??= { w: 0, r: 0, cnt: 0, last: L.n, wins: 0 };
-  const decay = Math.pow(FADE, L.n - s.last);
-  s.w = s.w * decay + 1; s.r = s.r * decay + R; s.cnt++; s.last = L.n; if (R > 0) s.wins++;
+  const s = L.stats[key] ??= { w: 0, r: 0, wv: 0, cnt: 0, last: L.now };
+  const d = fade(L, s);
+  s.w = s.w * d + 1; s.r = s.r * d + R; s.wv = s.wv * d + (R > 0 ? 1 : 0); s.cnt++; s.last = L.now;
 }
 function read(L, key) {
   const s = L.stats[key];
-  if (!s) return { w: 0, mean: 0, cnt: 0, wins: 0 };
-  const decay = Math.pow(FADE, L.n - s.last);
-  const w = s.w * decay, r = s.r * decay;
-  return { w, mean: r / (w + SHRINK), raw: w > 0 ? r / w : 0, cnt: s.cnt, wins: s.wins };
+  if (!s) return { w: 0, mean: 0, raw: 0, cnt: 0, winRate: 0 };
+  const d = fade(L, s);
+  const w = s.w * d, r = s.r * d;
+  return { w, mean: r / (w + SHRINK), raw: w > 0 ? r / w : 0, cnt: s.cnt, winRate: w > 0 ? s.wv * d / w * 100 : 0 };
 }
 const keysOf = o => ({
   setup: `S|${o.setup}`, group: `G|${o.setup}|${o.group}`, grade: `A|${o.grade}`, symbol: `Y|${o.symbol}`,
@@ -36,7 +37,7 @@ const keysOf = o => ({
 
 // a resolved signal becomes a lesson
 export function learn(L, o) {
-  L.n++; L.lessons++;
+  L.n++; L.lessons++; L.now = Math.max(L.now, o.tRes);
   const k = keysOf(o);
   for (const key of Object.values(k)) bump(L, key, o.R);
   bump(L, 'ALL', o.R);
@@ -78,7 +79,7 @@ export function summary(L, setups, groups) {
   for (const s of setups) for (const g of groups) {
     const r = read(L, `G|${s}|${g}`);
     if (!r.cnt) continue;
-    rows.push({ setup: s, group: g, n: r.cnt, w: r.w, avgR: r.raw, est: r.mean, winRate: r.wins / r.cnt * 100 });
+    rows.push({ setup: s, group: g, n: r.cnt, w: r.w, avgR: r.raw, est: r.mean, winRate: r.winRate });
   }
   return { lessons: L.lessons, ready: L.lessons >= READY, weights: factorWeights(L), rows, overall: read(L, 'ALL').raw, history: L.history };
 }

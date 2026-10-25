@@ -24,12 +24,19 @@ export const BLOCK_REASONS = {
   timeMachine: 'ماشین زمان: شانس کافی نبود',
   analyst: 'تحلیل‌گر: نشانه‌های چارت ضعیف بود',
   learned: 'تجربه: این نوع معامله اخیراً ضرر داده',
+  costly: 'کارمزد نسبت به ریسک زیاد بود',
 };
 
 export function runSimulation({ data, settings, start, end, capital }) {
   const S = settings;
   const startCap = capital ?? S.capital;
   const syms = Object.keys(data).filter(s => S.symbols[s] !== false && data[s] && data[s].t.length > 60);
+  // optional: which setups may trade on which asset group (from the optimizer)
+  const gs = S.groupStrategies;
+  const keys = Object.keys(S.strategies);
+  const groupSet = {};
+  if (gs) for (const g of ['crypto', 'meme', 'metal', 'energy']) groupSet[g] = { ...S, strategies: Object.fromEntries(keys.map(k => [k, !!S.strategies[k] && (gs[g] || []).includes(k)])) };
+  const setFor = s => (gs ? groupSet[assetBySymbol[s]?.group] || groupSet.crypto : S);
   const preps = {}, scanStates = {};
   for (const s of syms) { preps[s] = prepare(data[s]); scanStates[s] = newScanState(); }
 
@@ -90,6 +97,8 @@ export function runSimulation({ data, settings, start, end, capital }) {
     const stopPct = perUnit / fill * 100;
     if (stopPct < S.minStopPct) return blk('tightStop', s, t);
     if (stopPct > S.maxStopPct) return blk('wideStop', s, t);
+    // fees and slippage of the round trip, as a share of the risk: a trade they would eat is skipped
+    if (S.maxCostR != null && (2 * feePct(s) + 2 * slip) * fill / perUnit > S.maxCostR) return blk('costly');
     if (open.size >= S.maxOpen) return blk('maxOpen', s, t);
     const d = day(t);
     if (d.trades >= S.maxTradesPerDay) return blk('perDay', s, t);
@@ -146,6 +155,8 @@ export function runSimulation({ data, settings, start, end, capital }) {
     if (j >= p.t.length) return null;
     const dir = hit.dir, entry = p.o[j], risk = (entry - hit.stop) * dir;
     if (!(risk > 0) || risk / entry * 100 < S.minStopPct || risk / entry * 100 > S.maxStopPct) return null;
+    const cost = (2 * feePct(s) + 2 * slip) * entry / risk;
+    if (S.maxCostR != null && cost > S.maxCostR) return null; // a trade the robot would never take teaches nothing
     const target = entry + dir * S.targetR * risk;
     let R = null, k = j;
     for (; k < p.t.length && k < j + maxHold; k++) {
@@ -154,7 +165,6 @@ export function runSimulation({ data, settings, start, end, capital }) {
       if (k === j + maxHold - 1) { R = (p.c[k] - entry) * dir / risk; break; }
     }
     if (R === null) return null; // not decided yet: nothing to learn
-    const cost = (2 * feePct(s) + 2 * slip) * entry / risk;
     return { setup: hit.setup, group: assetBySymbol[s]?.group, symbol: s, grade: hit.ana?.grade, ana: hit.ana, R: R - cost, tRes: p.t[k] + BAR_MS, live: t >= start, dec: 'skipped', seq: seq++ };
   }
 
@@ -171,7 +181,7 @@ export function runSimulation({ data, settings, start, end, capital }) {
       const i = p.idx.get(t);
       if (i === undefined) continue;
       if (!live) { // warm-up: watch and learn, no trading
-        const hit = scan(p, i, S, scanStates[s]);
+        const hit = scan(p, i, setFor(s), scanStates[s]);
         if (hit) { if (ANALYST) hit.ana = analyze(p, i, hit, S); const o = observe(s, p, i, t, hit); if (o) waiting.push(o); }
         lastClose[s] = p.c[i];
         continue;
@@ -198,7 +208,7 @@ export function runSimulation({ data, settings, start, end, capital }) {
       lastClose[s] = p.c[i];
 
       // 3) scan the closed bar for a new setup
-      const hit = scan(p, i, S, scanStates[s]);
+      const hit = scan(p, i, setFor(s), scanStates[s]);
       if (hit) {
         signals++;
         if (ANALYST) hit.ana = analyze(p, i, hit, S);
