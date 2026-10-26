@@ -1,6 +1,9 @@
-import { ASSETS, GROUPS, STRATEGIES, FAMILIES, DEFAULT_SETTINGS, BAR_MS, WARMUP_BARS, assetBySymbol } from './config.js';
+import { ASSETS, GROUPS, STRATEGIES, FAMILIES, DEFAULT_SETTINGS, BAR_MS, WARMUP_BARS, OPTIMIZED, PRO_DEFAULTS, assetBySymbol } from './config.js';
 import { runSimulation, closeAllAtEnd, computeStats, signalStats, BLOCK_REASONS } from './engine.js';
-import { ensureHistory, klines, tickers, liveStream, pool, unavailable, netState, toSeries, mode, probe } from './data.js';
+import { ensureHistory, ensureDeriv, klines, tickers, liveStream, pool, unavailable, netState, toSeries, mode, probe } from './data.js';
+import { confidence, walkForward, wfWarmupBars } from './validate.js';
+import { REGIME_NAMES } from './regime.js';
+import { SESSION_NAMES } from './calendar.js';
 import { createCandleChart, createAreaChart, priceDecimals, sparkPath } from './chart.js';
 import { prepare } from './strategies.js';
 import { FACTORS, analysisLine } from './analyst.js';
@@ -27,13 +30,18 @@ const charts = [];
 const $ = sel => document.querySelector(sel);
 const DAY = 86400000;
 
+function deep(x) { return JSON.parse(JSON.stringify(x ?? null)); }
 function mergeSettings(saved) {
   return {
     ...DEFAULT_SETTINGS, ...saved,
     strategies: { ...DEFAULT_SETTINGS.strategies, ...(saved.strategies || {}) },
     symbols: { ...DEFAULT_SETTINGS.symbols, ...(saved.symbols || {}) },
+    // the pro desk is on for new tests unless it was switched off (null)
+    pro: saved.pro === null ? null : { ...deep(PRO_DEFAULTS), ...(saved.pro || {}) },
   };
 }
+// bars needed before the start: slow averages on the signal timeframe, plus the learning warm-up
+const warmupFor = st => Math.round(300 * Math.max(1, (st.pro?.tf || 5) / 5)) + (st.learn ? Math.round((st.learnWarmDays ?? 3) * 288) : 0);
 
 /* ---------------- formatting ---------------- */
 const nf = (x, d = 2) => (isFinite(x) ? x : 0).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -50,7 +58,7 @@ function dur(ms) {
   if (h) return `${h} ساعت و ${m} دقیقه`;
   return `${m} دقیقه`;
 }
-const REASON = { target: 'هدف', stop: 'حد ضرر', time: 'پایان زمان', end: 'پایان تست' };
+const REASON = { target: 'هدف', stop: 'حد ضرر', trail: 'حد ضرر جابه‌جاشده', time: 'پایان زمان', end: 'پایان تست' };
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 /* ---------------- icons ---------------- */
@@ -207,16 +215,17 @@ function blockedCard(res) {
 function tradeRow(x, live = false, res = null) {
   const a = assetBySymbol[x.symbol];
   const px = live ? (S.prices[x.symbol] ?? res?.lastClose[x.symbol] ?? x.entry) : x.exit;
-  const pnl = live ? (px - x.entry) * x.qty * x.dir - x.entryFee : x.pnl;
+  const pnl = live ? (px - x.entry) * x.qty * x.dir - x.entryFee + (x.pGross || 0) - (x.pFees || 0) - (x.funding || 0) : x.pnl;
   const R = pnl / x.riskUSDT;
   const side = x.dir > 0 ? '<span class="tag up">خرید</span>' : '<span class="tag down">فروش</span>';
-  const reason = live ? `<span class="tag">باز</span>` : `<span class="tag ${x.reason === 'target' ? 'up' : x.reason === 'stop' ? 'down' : ''} reason">${REASON[x.reason]}</span>`;
+  const reason = (live ? `<span class="tag">باز</span>` : `<span class="tag ${x.reason === 'target' ? 'up' : x.reason === 'stop' ? 'down' : ''} reason">${REASON[x.reason] || x.reason}</span>`) + (x.partialDone ? ' <span class="tag up">نیمی با سود بسته شد</span>' : '');
   return `<div class="row trade click" data-sym="${x.symbol}">${coin(x.symbol)}
     <div class="main"><div class="t1">${esc(a?.name || x.symbol)} ${side} ${reason}</div>
     <div class="t2">${STRATEGIES[x.setup]?.name} · <span class="num">${fp(x.entry)} → ${fp(px)}</span> · حد ضرر <span class="num">${fp(x.stop)}</span> · هدف <span class="num">${fp(x.target)}</span></div>
     <div class="t2">${fdt(x.entryTime)}${live ? '' : ' تا ' + fdt(x.exitTime)} · <span class="num">${nf(x.notional)}</span> USDT</div>
     ${x.ana ? `<div class="t2 ana-line"><span class="grade g${x.ana.grade}">${x.ana.grade}</span> ${esc(analysisLine(x.ana))}</div>` : ''}
-    ${x.learn ? `<div class="t2 ana-line">🧠 ${esc(x.learn.why)}${x.learn.mult && x.learn.mult !== 1 ? ` · ریسک ×${x.learn.mult.toFixed(2)}` : ''}</div>` : ''}</div>
+    ${x.learn ? `<div class="t2 ana-line">🧠 ${esc(x.learn.why)}${x.learn.mult && x.learn.mult !== 1 ? ` · ریسک ×${x.learn.mult.toFixed(2)}` : ''}</div>` : ''}
+    ${x.stop0 != null ? `<div class="t2 ana-line">کندل ${faNum(x.tf || 5)} دقیقه‌ای${x.reg ? ` · ${REGIME_NAMES[x.reg] || x.reg}` : ''} · بیشترین سود در مسیر <span class="num up">${nf(x.mfe, 1)}R</span> · بیشترین ضرر در مسیر <span class="num down">${nf(x.mae, 1)}R</span>${x.funding ? ` · فاندینگ <span class="num">${signed(-x.funding)}</span>` : ''}${x.brake ? ` · ریسک نصف (ترمز)` : ''}</div>` : ''}</div>
     <div class="end"><div class="t1 num ${cls(pnl)}">${signed(pnl)}</div><div class="t2 num ${cls(R)}">${signed(R, 2)}R</div></div></div>`;
 }
 
@@ -251,7 +260,7 @@ function loadTests() {
 const saveTests = () => save('tests', S.tests);
 const testById = id => S.tests.find(t => t.id === id);
 const testSymbols = t => ASSETS.map(a => a.symbol).filter(s => t.settings.symbols[s] && !unavailable.has(s));
-const testStrats = t => Object.keys(STRATEGIES).filter(k => t.settings.strategies[k]);
+const testStrats = t => Object.keys(STRATEGIES).filter(k => t.settings.strategies[k] && (!t.settings.groupStrategies || Object.values(t.settings.groupStrategies).some(l => l.includes(k))));
 const testDays = t => t.settings.testDays ?? (t.end - t.start) / DAY;
 const nowBarT = () => Math.floor(Date.now() / BAR_MS) * BAR_MS;
 function focusTest() {
@@ -279,7 +288,9 @@ async function refreshTests(force = false) {
     const from = t.start - (t.warmup || 200) * BAR_MS;
     to = Math.max(to, Math.min(nowBar, t.end));
     for (const s of testSymbols(t)) need[s] = Math.min(need[s] ?? Infinity, from);
+    if (t.settings.pro?.regime) need.BTCUSDT = Math.min(need.BTCUSDT ?? Infinity, from); // bitcoin leads crypto
   }
+  const wantDeriv = new Set(todo.filter(t => t.settings.pro?.deriv).flatMap(t => testSymbols(t)));
   const syms = Object.keys(need);
   S.liveLoading = { done: 0, total: syms.length };
   updateLoading();
@@ -291,13 +302,16 @@ async function refreshTests(force = false) {
       S.liveLoading.done++; updateLoading();
     });
     if (!Object.keys(full).length) throw new Error('no data');
+    const dv = {};
+    if (wantDeriv.size) await pool([...wantDeriv], 4, async s => { try { dv[s] = await ensureDeriv(s, need[s], to); } catch { /* no futures data */ } });
     for (const t of todo) {
       const from = t.start - (t.warmup || 200) * BAR_MS, tt = Math.min(nowBar, t.end);
       const data = {};
       for (const s of testSymbols(t)) if (full[s]) data[s] = sliceSeries(full[s], from, tt);
+      if (t.settings.pro?.regime && full.BTCUSDT && !data.BTCUSDT) data.BTCUSDT = sliceSeries(full.BTCUSDT, from, tt);
       if (!Object.keys(data).length) continue;
       if (Date.now() < t.start) { S.res[t.id] = null; continue; }
-      let res = runSimulation({ data, settings: t.settings, start: t.start, end: Math.min(tt, t.end), capital: t.settings.capital });
+      let res = runSimulation({ data, settings: t.settings, start: t.start, end: Math.min(tt, t.end), capital: t.settings.capital, deriv: t.settings.pro?.deriv ? dv : null });
       if (Date.now() >= t.end && res.lastTime >= t.end - BAR_MS * 2) {
         res = closeAllAtEnd(res, t.settings); res.final = true;
         if (t.status !== 'done') {
@@ -371,12 +385,12 @@ const BRAINS = {
 const brainOf = st => st.learn ? 'learn' : st.analyst ? 'analyst' : 'off';
 function freshDraft() {
   const prof = activeProfile(S.settings);
-  return { name: `تست ${faNum(S.tests.length + 1)}`, capital: S.settings.capital, days: S.settings.testDays, profile: prof === 'custom' ? 'custom' : prof, strat: 'all', assets: 'all', brain: brainOf(S.settings) };
+  return { name: `تست ${faNum(S.tests.length + 1)}`, capital: S.settings.capital, days: S.settings.testDays, profile: prof === 'custom' ? 'custom' : prof, strat: 'all', assets: 'all', brain: brainOf(S.settings), pro: !!S.settings.pro };
 }
 const faNum = n => String(n).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
 function draftSettings(dr) {
   const st = JSON.parse(JSON.stringify(S.settings));
-  if (dr.profile !== 'custom' && PROFILES[dr.profile]) Object.assign(st, PROFILES[dr.profile].set);
+  if (dr.profile !== 'custom' && PROFILES[dr.profile]) Object.assign(st, JSON.parse(JSON.stringify(PROFILES[dr.profile].set)));
   st.capital = Math.max(10, +dr.capital || 1000);
   st.testDays = dr.days;
   const ks = new Set(STRAT_SETS[dr.strat][1]());
@@ -385,6 +399,7 @@ function draftSettings(dr) {
   st.symbols = Object.fromEntries(ASSETS.map(a => [a.symbol, ss.has(a.symbol)]));
   st.analyst = dr.brain !== 'off';
   st.learn = dr.brain === 'learn';
+  if (dr.profile !== 'profit') st.pro = dr.pro ? (st.pro || deep(PRO_DEFAULTS)) : null; // the profit profile always uses the desk
   return st;
 }
 function newTestForm(dr) {
@@ -398,13 +413,14 @@ function newTestForm(dr) {
     <div class="pick"><div class="pick-l">دارایی‌ها</div><div class="chips">${chips(Object.entries(ASSET_SETS).map(([k, v]) => [k, v[0]]), dr.assets, 'nasset')}</div></div>
     <div class="pick"><div class="pick-l">مغز ربات</div><div class="chips">${chips(Object.entries(BRAINS).map(([k, v]) => [k, v[0]]), dr.brain, 'nbrain')}</div></div>
     <div class="muted ntf-brain">${BRAINS[dr.brain][1]}</div>
+    ${dr.profile === 'profit' ? '' : `<div class="pick"><div class="pick-l">میز حرفه‌ای</div><div class="chips">${chips([['on', 'روشن (۱۰ مهارت)'], ['off', 'خاموش (مثل قبل)']], dr.pro ? 'on' : 'off', 'npro')}</div></div>`}
     <div class="muted ntf-sum">${draftSummary(dr)}</div>
   </div>`;
 }
 function draftSummary(dr) {
   const st = draftSettings(dr);
   const nS = Object.values(st.strategies).filter(Boolean).length, nA = Object.values(st.symbols).filter(Boolean).length;
-  return `${nS} ستاپ روی ${nA} دارایی · ${dr.profile === 'custom' ? 'تنظیمات دستی' : PROFILES[dr.profile].desc} · ریسک هر معامله ${nf(st.capital * st.riskPct / 100)} تتر`;
+  return `${nS} ستاپ روی ${nA} دارایی · ${dr.profile === 'custom' ? 'تنظیمات دستی' : PROFILES[dr.profile].desc} · ریسک هر معامله ${nf(st.capital * st.riskPct / 100)} تتر${st.pro ? ` · میز حرفه‌ای، کندل ${faNum(st.pro.tf)} دقیقه‌ای` : ''}`;
 }
 function bindNewTestForm(root, dr, rerender) {
   root.querySelector('#ntName').oninput = e => { dr.name = e.target.value; };
@@ -414,13 +430,14 @@ function bindNewTestForm(root, dr, rerender) {
   root.querySelectorAll('[data-nstrat]').forEach(b => b.onclick = () => { dr.strat = b.dataset.nstrat; rerender(); });
   root.querySelectorAll('[data-nasset]').forEach(b => b.onclick = () => { dr.assets = b.dataset.nasset; rerender(); });
   root.querySelectorAll('[data-nbrain]').forEach(b => b.onclick = () => { dr.brain = b.dataset.nbrain; rerender(); });
+  root.querySelectorAll('[data-npro]').forEach(b => b.onclick = () => { dr.pro = b.dataset.npro === 'on'; rerender(); });
 }
 function startTest(dr) {
   const settings = draftSettings(dr);
   if (!Object.values(settings.strategies).some(Boolean)) return toast('هیچ ستاپی انتخاب نشده');
   if (!Object.values(settings.symbols).some(Boolean)) return toast('هیچ دارایی‌ای انتخاب نشده');
   const start = Math.ceil(Date.now() / BAR_MS) * BAR_MS;
-  const t = { id: newId(), name: (dr.name || '').trim() || `تست ${faNum(S.tests.length + 1)}`, status: 'running', start, end: start + dr.days * DAY, settings, warmup: DEFAULT_WARMUP + (settings.learn ? Math.round((settings.learnWarmDays ?? 3) * 288) : 0) };
+  const t = { id: newId(), name: (dr.name || '').trim() || `تست ${faNum(S.tests.length + 1)}`, status: 'running', start, end: start + dr.days * DAY, settings, warmup: warmupFor(settings) };
   S.tests.push(t); saveTests();
   S.seen[t.id] = 0; save('seen2', S.seen);
   S.focus = t.id;
@@ -476,12 +493,16 @@ function confirmBox(msg, okText = 'تأیید') {
 const DURATIONS = [[1 / 24, '۱ ساعت'], [4 / 24, '۴ ساعت'], [0.5, '۱۲ ساعت'], [1, '۱ روز'], [3, '۳ روز'], [7, '۷ روز']];
 const durLabel = d => (DURATIONS.find(x => Math.abs(x[0] - d) < 1e-6) || [d, d >= 1 ? `${+d.toFixed(2)} روز` : `${Math.round(d * 24)} ساعت`])[1];
 // «پرفشار» forces many short trades so accuracy can be measured fast
+// the validator (backtest page) can replace the profit profile with a fresh walk-forward choice
+const savedOpt = load('optProfile', null);
 const PROFILES = {
-  standard: { name: 'استاندارد', desc: 'هدف ۲R، نگه‌داری تا ۴ ساعت، ریسک ۱٪', set: { targetR: 2, maxHoldHours: 4, riskPct: 1, maxPositionPct: 30, maxOpen: 6, cooldownBars: 6, maxTradesPerDay: 60, dailyLossPct: 6 } },
-  stress: { name: 'پرفشار', desc: 'هدف ۱.۵R، نگه‌داری تا ۱ ساعت، ریسک ۰.۵٪، تا ۱۲ پوزیشن هم‌زمان', set: { targetR: 1.5, maxHoldHours: 1, riskPct: 0.5, maxPositionPct: 12, maxOpen: 12, cooldownBars: 2, maxTradesPerDay: 300, dailyLossPct: 10 } },
+  profit: { name: 'سودمحور', desc: savedOpt?.desc || OPTIMIZED.desc, set: deep(savedOpt?.set || OPTIMIZED.set) },
+  standard: { name: 'استاندارد', desc: 'هدف ۲R، نگه‌داری تا ۴ ساعت، ریسک ۱٪', set: { targetR: 2, maxHoldHours: 4, riskPct: 1, maxPositionPct: 30, maxOpen: 6, cooldownBars: 6, maxTradesPerDay: 60, dailyLossPct: 6, groupStrategies: null } },
+  stress: { name: 'پرفشار', desc: 'هدف ۱.۵R، نگه‌داری تا ۱ ساعت، ریسک ۰.۵٪، تا ۱۲ پوزیشن هم‌زمان', set: { targetR: 1.5, maxHoldHours: 1, riskPct: 0.5, maxPositionPct: 12, maxOpen: 12, cooldownBars: 2, maxTradesPerDay: 300, dailyLossPct: 10, groupStrategies: null } },
 };
-const activeProfile = st => Object.keys(PROFILES).find(k => Object.entries(PROFILES[k].set).every(([f, v]) => st[f] === v)) || 'custom';
-function applyProfile(k) { Object.assign(S.settings, PROFILES[k].set); save('settings', S.settings); }
+const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+const activeProfile = st => Object.keys(PROFILES).find(k => Object.entries(PROFILES[k].set).every(([f, v]) => same(st[f], v))) || 'custom';
+function applyProfile(k) { Object.assign(S.settings, JSON.parse(JSON.stringify(PROFILES[k].set))); save('settings', S.settings); }
 
 /* ---------------- device sync ---------------- */
 // The robot is deterministic: the same start time and settings give the same
@@ -495,18 +516,20 @@ const fromBits = (s, n) => Array.from({ length: n }, (_, i) => !!((parseInt(s[i 
 function settingsDiff(st) {
   const d = {};
   for (const [k, v] of Object.entries(st)) {
-    if (k === 'strategies' || k === 'symbols' || k === 'analyst' || k === 'learn') continue;
+    if (k === 'strategies' || k === 'symbols' || k === 'analyst' || k === 'learn' || k === 'maxCostR' || k === 'pro') continue;
     if (DEFAULT_SETTINGS[k] !== v) d[k] = v;
   }
   if (st.analyst) d.an = 1;   // sent explicitly: tests made before these existed have them off
   if (st.learn) d.le = 1;
+  d.mc = st.maxCostR ?? 0;    // 0 = no cost filter (tests made before it existed)
+  if (st.pro) d.pr = st.pro;  // the pro desk (tests made before it have none)
   d.sk = toBits(STRAT_KEYS.map(k => !!st.strategies[k]));
   d.sy = toBits(SYM_KEYS.map(s => !!st.symbols[s]));
   return d;
 }
 function settingsFromDiff(d, legacy) {
-  const { sk, sy, an, le, strategies, symbols, analyst, learn, ...rest } = d || {};
-  const st = { ...DEFAULT_SETTINGS, ...rest, analyst: !!an, learn: !!le };
+  const { sk, sy, an, le, mc, pr, strategies, symbols, analyst, learn, maxCostR, pro, ...rest } = d || {};
+  const st = { ...DEFAULT_SETTINGS, ...rest, analyst: !!an, learn: !!le, maxCostR: mc ? mc : null, pro: pr || null };
   if (legacy) { // version 1: a diff against the old defaults (5 setups, 17 assets on)
     st.strategies = Object.fromEntries(STRAT_KEYS.map((k, i) => [k, i < LEGACY_STRATS ? (strategies?.[k] ?? true) : false]));
     st.symbols = Object.fromEntries(SYM_KEYS.map((s, i) => [s, i < LEGACY_SYMS ? (symbols?.[s] ?? true) : false]));
@@ -615,7 +638,7 @@ function howItWorks() {
   return `<div class="card glass">
     <h3>چطور کار می‌کند</h3>
     <div class="list">
-      ${[['۱', 'چند تست هم‌زمان', 'هر تست بودجه، مدت، پروفایل، ستاپ‌ها و دارایی‌های خودش را دارد؛ همه در یک پنل کنار هم'], ['۲', 'اسکنر', `${Object.keys(STRATEGIES).length} ستاپ (مهارت‌های تریدر و تحلیل‌گر چارت) روی کندل‌های ۵ دقیقه‌ای ${ASSETS.length} دارایی`], ['۳', 'ورود و خروج', 'فقط بعد از بسته شدن کندل؛ حد ضرر قبل از ورود، هدف بر حسب R و سقف زمان نگه‌داری'], ['۴', 'بودجه و ریسک', 'ریسک هر معامله درصدی از همان بودجه‌ی تست، حد ضرر روزانه و سقف پوزیشن باز'], ['۵', 'کارمزد واقعی', `کارمزد ${S.settings.feeSpotPct}% و لغزش ${S.settings.slippagePct}% در هر معامله کم می‌شود`], ['۶', 'همگام‌سازی', 'با دکمه‌ی «همگام‌سازی» همه‌ی تست‌ها روی گوشی یا لپ‌تاپ دیگر هم باز می‌شوند']]
+      ${[['۱', 'چند تست هم‌زمان', 'هر تست بودجه، مدت، پروفایل، ستاپ‌ها و دارایی‌های خودش را دارد؛ همه در یک پنل کنار هم'], ['۲', 'اسکنر', `${Object.keys(STRATEGIES).length} ستاپ (مهارت‌های تریدر و تحلیل‌گر چارت) روی ${ASSETS.length} دارایی؛ با میز حرفه‌ای روی کندل‌های ${faNum(S.settings.pro?.tf || 5)} دقیقه‌ای و فقط در حالت بازار مناسب هر ستاپ`], ['۳', 'ورود و خروج', 'فقط بعد از بسته شدن کندل؛ حد ضرر قبل از ورود، هدف بر حسب R و سقف زمان نگه‌داری'], ['۴', 'بودجه و ریسک', 'ریسک هر معامله درصدی از همان بودجه‌ی تست، حد ضرر روزانه و سقف پوزیشن باز'], ['۵', 'کارمزد واقعی', `کارمزد ${S.settings.feeSpotPct}% و لغزش ${S.settings.slippagePct}% در هر معامله کم می‌شود`], ['۶', 'همگام‌سازی', 'با دکمه‌ی «همگام‌سازی» همه‌ی تست‌ها روی گوشی یا لپ‌تاپ دیگر هم باز می‌شوند']]
         .map(([n, a, b]) => `<div class="row"><span class="coin" style="background:linear-gradient(145deg,#2c4fb0,#0a1838)">${n}</span><div class="main"><div class="t1">${a}</div><div class="t2" style="white-space:normal">${b}</div></div></div>`).join('')}
     </div>
     <p class="note" style="margin:12px 0 0">اگر اپ را ببندید ربات متوقف نمی‌شود: با باز کردن دوباره، کندل‌های جاافتاده از Binance گرفته و دقیقاً همان معامله‌ها بازسازی می‌شوند.</p>
@@ -650,7 +673,7 @@ function testCard(t) {
   const eq = res ? thin(res.equity, 120) : snap?.equity;
   return `<div class="card glass test-card click" data-test="${t.id}">
     <div class="tc-head"><b>${esc(t.name)}</b>${statusTag(t)}</div>
-    <div class="tc-meta">${durLabel(testDays(t))} · ${profName(t.settings)} · ${testStrats(t).length} ستاپ · ${testSymbols(t).length} دارایی${t.settings.learn ? ' · <span class="tag brain">🧠 خودآموز</span>' : t.settings.analyst ? ' · <span class="tag brain">تحلیل‌گر</span>' : ''}</div>
+    <div class="tc-meta">${durLabel(testDays(t))} · ${profName(t.settings)} · ${testStrats(t).length} ستاپ · ${testSymbols(t).length} دارایی${t.settings.learn ? ' · <span class="tag brain">🧠 خودآموز</span>' : t.settings.analyst ? ' · <span class="tag brain">تحلیل‌گر</span>' : ''}${t.settings.pro ? ` · <span class="tag brain">حرفه‌ای · ${faNum(t.settings.pro.tf)}د</span>` : ''}</div>
     <div class="tc-eq num" data-teq="${t.id}">${st ? nf(st.equity) : '<span class="skeleton">1,000.00</span>'}<small>USDT</small></div>
     <div class="pnl-row" data-tpnl="${t.id}">${st ? pnlPills(st, cap) : ''}</div>
     ${miniSpark(eq, cap)}
@@ -769,9 +792,11 @@ function pageTest(main, t) {
       ${st ? verdictCard(st, res?.bench, L.settings.targetR) : `<div class="card glass"><div class="empty">${now < t.start ? 'تست از کندل ۵ دقیقه‌ای بعدی شروع می‌شود…' : '<span class="loader"></span><br>در حال ساخت نتیجه از کندل‌های بازار…'}</div></div>`}
       <div class="span-2">${st ? kpiTiles(st, { k: 'سیگنال اسکنر', v: res?.signals ?? '—', s: `${durLabel(testDays(t))} · ${profName(L.settings)}`, R: L.settings.targetR }) : ''}</div>
       <div class="card glass span-2"><h3>تنظیمات این تست</h3><div class="tc-cfg">
-        <span>پروفایل: <b>${profName(L.settings)}</b></span><span>ریسک هر معامله: <b class="num">${L.settings.riskPct}%</b></span><span>هدف: <b class="num">${L.settings.targetR}R</b></span><span>نگه‌داری: <b class="num">${L.settings.maxHoldHours}</b> ساعت</span><span>پوزیشن هم‌زمان: <b class="num">${L.settings.maxOpen}</b></span><span>شورت: <b>${L.settings.allowShort ? 'روشن' : 'خاموش'}</b></span><span>مغز ربات: <b>${BRAINS[brainOf(L.settings)][0]}</b></span></div>
-        <div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.9">ستاپ‌ها: ${enabled.map(k => STRATEGIES[k].name).join('، ')}<br>دارایی‌ها: ${testSymbols(t).map(s => assetBySymbol[s]?.short || s).join('، ')}</div></div>
+        <span>پروفایل: <b>${profName(L.settings)}</b></span><span>ریسک هر معامله: <b class="num">${L.settings.riskPct}%</b></span><span>هدف: <b class="num">${L.settings.targetR}R</b></span><span>نگه‌داری: <b class="num">${L.settings.maxHoldHours}</b> ساعت</span><span>پوزیشن هم‌زمان: <b class="num">${L.settings.maxOpen}</b></span><span>شورت: <b>${L.settings.pro ? (L.settings.pro.shorts ? 'روی فیوچرز' : 'خاموش') : L.settings.allowShort ? 'روشن' : 'خاموش'}</b></span><span>مغز ربات: <b>${BRAINS[brainOf(L.settings)][0]}</b></span><span>میز حرفه‌ای: <b>${L.settings.pro ? `روشن، کندل ${faNum(L.settings.pro.tf)} دقیقه‌ای` : 'خاموش'}</b></span></div>
+        ${L.settings.pro ? `<div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.9">${proLines(L.settings.pro).join(' · ')}</div>` : ''}
+        <div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.9">${L.settings.groupStrategies ? Object.entries(GROUPS).map(([g, gn]) => `ستاپ‌های ${gn}: ${(L.settings.groupStrategies[g] || []).filter(k => L.settings.strategies[k]).map(k => STRATEGIES[k].name).join('، ') || 'هیچ (این گروه معامله نمی‌شود)'}`).join('<br>') : `ستاپ‌ها: ${enabled.map(k => STRATEGIES[k].name).join('، ')}`}<br>${L.settings.maxCostR ? `سقف کارمزد: ${nf(L.settings.maxCostR * 100, 0)}٪ ریسک<br>` : ''}دارایی‌ها: ${testSymbols(t).map(s => assetBySymbol[s]?.short || s).join('، ')}</div></div>
       ${res?.learn ? `<div class="span-2">${experienceCard(res)}</div>` : res?.decisions ? `<div class="span-2">${decisionsCard(res)}</div>` : ''}
+      ${res && res.closed.length ? `<div class="span-2 grid cols-2">${validationCard(res, L.settings)}${postTradeCard(res)}</div>` : ''}
       ${res ? `<div class="span-2">${accuracyCard(res, enabled)}</div>` : ''}
       <div class="card glass span-2"><h3>منحنی سرمایه <span class="muted">هر نقطه = بسته شدن یک کندل ۵ دقیقه‌ای</span></h3><div class="chart-box" id="eqChart"></div></div>
       <div class="card glass"><h3>پوزیشن‌های باز <span class="muted">قیمت زنده</span></h3><div class="list" id="openList">${openList(res)}</div></div>
@@ -792,22 +817,22 @@ function pageTest(main, t) {
   updateLoading();
 }
 /* the analyst's and the memory's decisions, and what the memory has learned */
-const DEC = { taken: 'معامله شد', learned: 'رد به خاطر تجربه', analyst: 'رد به خاطر تحلیل چارت', other: 'رد توسط مدیر ریسک', skipped: 'پوزیشن باز بود یا وقت گذشت' };
+const DEC = { taken: 'معامله شد', learned: 'رد به خاطر تجربه', analyst: 'رد به خاطر تحلیل چارت', other: 'رد توسط مدیر ریسک', skipped: 'پوزیشن باز بود یا وقت گذشت', filtered: 'رد توسط فیلترها (حالت بازار، بیت‌کوین، خبر، کارمزد)' };
 function decisionRows(res) {
   const d = res.decisions || {};
-  return ['taken', 'learned', 'analyst', 'other'].filter(k => d[k]).map(k => {
+  return ['taken', 'filtered', 'learned', 'analyst', 'other'].filter(k => d[k]).map(k => {
     const x = d[k], avg = x.sumR / x.n;
     return `<div class="row"><div class="main"><div class="t1">${DEC[k]}</div><div class="t2">${x.n} سیگنال · ${nf(x.wins / x.n * 100, 0)}% به هدف رسید</div></div><div class="end"><div class="t1 num ${cls(avg)}">${signed(avg, 2)}R</div><div class="t2">میانگین بعد از کارمزد</div></div></div>`;
   }).join('');
 }
 function decisionsCard(res) {
-  return `<div class="card glass"><h3>تصمیم‌های تحلیل‌گر <span class="muted">هر سیگنال تا نتیجه دنبال شد</span></h3><div class="list">${decisionRows(res) || '<div class="empty">هنوز سیگنالی به نتیجه نرسیده</div>'}</div>
+  return `<div class="card glass"><h3>${res.analyst ? 'تصمیم‌های تحلیل‌گر' : 'تصمیم‌های ربات'} <span class="muted">هر سیگنال تا نتیجه دنبال شد</span></h3><div class="list">${decisionRows(res) || '<div class="empty">هنوز سیگنالی به نتیجه نرسیده</div>'}</div>
     <p class="muted" style="font-size:12px;margin:10px 0 0;line-height:1.9">اگر میانگین سیگنال‌های ردشده از معامله‌های انجام‌شده بدتر باشد، یعنی تحلیل‌گر درست رد کرده است.</p></div>`;
 }
 function experienceCard(res) {
   const Lm = res.learn;
   const w = Lm.weights, maxW = Math.max(0.05, ...Object.values(w).map(Math.abs));
-  const bars = Object.entries(FACTORS).map(([k, name]) => {
+  const bars = Object.entries(FACTORS).filter(([k]) => k in w).map(([k, name]) => {
     const v = w[k] || 0, width = Math.abs(v) / maxW * 50;
     const side = v >= 0 ? `left:${50 - width}%;right:50%` : `right:${50 - width}%;left:50%`;
     return `<div class="bar-row"><div><b style="font-weight:600">${name}</b></div><div class="bar-track"><span class="mid"></span><div style="${side};background:var(--${v >= 0 ? 'up' : 'down'})"></div></div><div class="num ${cls(v)}" style="font-weight:700;min-width:70px;text-align:left">${signed(v, 2)}R</div></div>`;
@@ -831,9 +856,69 @@ function experienceCard(res) {
       <div><div class="grp-h">بهترین تجربه‌ها</div><div class="list">${best.map(rowHtml).join('') || '<div class="empty">هنوز کافی نیست</div>'}</div>
         ${worst.length ? `<div class="grp-h">چیزهایی که یاد گرفت انجام ندهد</div><div class="list">${worst.map(rowHtml).join('')}</div>` : ''}</div>
     </div>
+    ${Lm.ctx?.length ? `<div class="grp-h">درس‌های زمان و حالت بازار</div><div class="list">${[...Lm.ctx].sort((a, b) => Math.abs(b.est) - Math.abs(a.est)).slice(0, 6).map(c => `<div class="row"><div class="main"><div class="t1">${c.kind === 'regime' ? `${STRATEGIES[c.a]?.name || c.a} در ${REGIME_NAMES[c.b] || c.b}` : `${GROUPS[c.a] || c.a} در ${SESSION_NAMES[c.b] || c.b}`}</div><div class="t2">${c.n} درس · ${nf(c.winRate, 0)}% برد</div></div><div class="end"><div class="t1 num ${cls(c.avgR)}">${signed(c.avgR, 2)}R</div></div></div>`).join('')}</div>` : ''}
     ${curve ? `<div class="grp-h">منحنی یادگیری <span class="muted">میانگین نتیجه‌ی تجربه‌ها در طول زمان</span></div>${curve}` : ''}
     <details class="more"><summary>همه‌ی تصمیم‌ها ▾</summary><div class="list" style="margin-top:8px">${decisionRows(res)}</div></details>
     <p class="muted" style="font-size:12px;margin:10px 0 0;line-height:1.9">ربات قبل از شروع ۳ روز بازار را تماشا کرد تا با تجربه شروع کند. تجربه‌های تازه وزن بیشتری دارند و ستاپی که کنار گذاشته شده همچنان زیر نظر است تا اگر دوباره خوب شد، برگردد.</p></div>`;
+}
+/* skill 1: is the result luck? skill 10: what the trades say about the exits */
+function validationCard(res, settings) {
+  const c = confidence(res.closed, settings.riskPct);
+  const kind = { good: 'good', mid: 'mid', bad: 'bad', low: 'mid' }[c.level];
+  const b = c.b, mc = c.mc;
+  return `<div class="card glass"><h3>اعتبار نتیجه <span class="muted">شانس بود یا مهارت؟</span></h3>
+    <div class="verdict ${kind}" style="margin-bottom:12px"><div class="badge">${c.level === 'good' ? '✓' : c.level === 'bad' ? '!' : '?'}</div><div><b>${c.level === 'good' ? 'نتیجه معنادار است' : c.level === 'bad' ? 'ضرر واقعی است، نه بدشانسی' : c.level === 'low' ? 'نمونه کم است' : 'هنوز قطعی نیست'}</b><p>${c.text}</p></div></div>
+    ${b ? `<div class="kpis">
+      <div class="kpi glass flat"><div class="k">احتمال برتری واقعی</div><div class="v num ${b.pPos >= 0.75 ? 'up' : b.pPos <= 0.25 ? 'down' : ''}">${nf(b.pPos * 100, 0)}%</div><div class="s">میانگین بالای صفر (بوت‌استرپ)</div></div>
+      <div class="kpi glass flat"><div class="k">بازه‌ی میانگین هر معامله</div><div class="v num" style="font-size:17px">${signed(b.lo, 2)} تا ${signed(b.hi, 2)}R</div><div class="s">با ۹۰٪ اطمینان</div></div>
+      <div class="kpi glass flat"><div class="k">افت بدبینانه</div><div class="v num down">${nf(mc.dd95, 1)}%</div><div class="s">۵٪ ترتیب‌های تصادفی بدتر از این</div></div>
+      <div class="kpi glass flat"><div class="k">احتمال ضرر با همین معامله‌ها</div><div class="v num">${nf(mc.pLoss * 100, 0)}%</div><div class="s">در ۱۰۰۰ ترتیب تصادفی (مونت‌کارلو)</div></div>
+    </div>` : ''}</div>`;
+}
+function postTradeCard(res) {
+  const T = res.closed;
+  const Rs = T.map(x => x.R), n = T.length;
+  const wins = T.filter(x => x.R > 0), losses = T.filter(x => x.R <= 0);
+  const exp = Rs.reduce((a, x) => a + x, 0) / n;
+  const bins = [[-Infinity, -1.5], [-1.5, -0.5], [-0.5, 0], [0, 0.5], [0.5, 1.5], [1.5, Infinity]];
+  const lab = ['زیر −۱.۵', '−۱.۵ تا −۰.۵', '−۰.۵ تا ۰', '۰ تا ۰.۵', '۰.۵ تا ۱.۵', 'بالای ۱.۵'];
+  const cnt = bins.map(([a, b]) => Rs.filter(r => r > a && r <= b).length), maxC = Math.max(1, ...cnt);
+  const hist = cnt.map((c, k) => `<div class="hist-col"><div class="hist-bar" style="height:${c / maxC * 100}%;background:var(--${k < 3 ? 'down' : 'up'})"></div><span class="num">${c}</span><small>${lab[k]}</small></div>`).join('');
+  const hasEx = T.some(x => x.mfe != null);
+  const tips = [];
+  if (hasEx) {
+    const saved = losses.filter(x => x.mfe >= 1).length;
+    if (losses.length >= 5 && saved / losses.length > 0.25) tips.push(`${nf(saved / losses.length * 100, 0)}٪ باخت‌ها اول دست‌کم ۱R سود دیدند و بعد برگشتند: جابه‌جا کردن حد ضرر به نقطه‌ی ورود یا برداشتن بخشی از سود در ۱R کمک می‌کند.`);
+    const med = a => { const b = [...a].sort((x, y) => x - y); return b.length ? b[b.length >> 1] : 0; };
+    const wMae = med(wins.map(x => x.mae));
+    if (wins.length >= 5 && wMae < 0.3) tips.push(`برنده‌ها معمولاً کمتر از ${nf(wMae, 2)}R خلاف جهت رفتند: حد ضرر شاید بیش از حد دور است.`);
+    if (wins.length >= 5 && wMae > 0.75) tips.push(`برنده‌ها هم تا ${nf(wMae, 2)}R خلاف جهت رفتند: حد ضرر تنگ‌تر خیلی از آن‌ها را از دست می‌داد.`);
+  }
+  const time = T.filter(x => x.reason === 'time').length;
+  if (n >= 10 && time / n > 0.35) tips.push(`${nf(time / n * 100, 0)}٪ معامله‌ها با پایان زمان بسته شدند: هدف دور است یا زمان نگه‌داری کوتاه.`);
+  const feeShare = T.reduce((a, x) => a + x.fees, 0) / Math.max(1e-9, T.reduce((a, x) => a + Math.abs(x.gross), 0));
+  if (feeShare > 0.3) tips.push(`کارمزد ${nf(feeShare * 100, 0)}٪ اندازه‌ی سود و زیان‌هاست: حد ضررهای بزرگ‌تر (تایم‌فریم بالاتر) یا معامله‌ی کمتر لازم است.`);
+  const avgW = wins.length ? wins.reduce((a, x) => a + x.R, 0) / wins.length : 0, avgL = losses.length ? losses.reduce((a, x) => a + x.R, 0) / losses.length : 0;
+  return `<div class="card glass"><h3>تحلیل پس از معامله <span class="muted">ژورنال</span></h3>
+    <div class="kpis">
+      <div class="kpi glass flat"><div class="k">امید ریاضی</div><div class="v num ${cls(exp)}">${signed(exp, 2)}R</div><div class="s">میانگین سود هر معامله بعد از کارمزد</div></div>
+      <div class="kpi glass flat"><div class="k">برد / باخت متوسط</div><div class="v num"><span class="up">${signed(avgW, 2)}</span> / <span class="down">${signed(avgL, 2)}</span></div><div class="s">بر حسب R</div></div>
+    </div>
+    <div class="grp-h">پخش نتیجه‌ها (R)</div><div class="hist">${hist}</div>
+    ${tips.length ? `<div class="grp-h">پیشنهادها</div><ul class="tips">${tips.map(x => `<li>${x}</li>`).join('')}</ul>` : `<p class="muted" style="font-size:12px;margin:10px 0 0">${n < 10 ? 'برای پیشنهاد، معامله‌های بیشتری لازم است.' : 'الگوی مشکل‌داری در خروج‌ها دیده نشد.'}</p>`}</div>`;
+}
+// what the pro desk is doing, in plain words
+function proLines(pr) {
+  const out = [];
+  if (pr.regime) out.push('هر ستاپ فقط در حالت بازار مناسب خودش، با تأیید بیت‌کوین');
+  if (pr.risk) out.push(`حداکثر ${faNum(pr.risk.maxCluster)} پوزیشن هم‌جهت در هر گروه، ریسک باز کل ${faNum(pr.risk.maxRiskPct)}٪، ریسک نصف بعد از ${faNum(pr.risk.ddHalf)}٪ افت یا ${faNum(pr.risk.streak)} باخت پشت سر هم، توقف یک‌روزه بعد از ${faNum(pr.risk.ddStop)}٪ افت`);
+  if (pr.exits) out.push(`${faNum(pr.exits.partialPct)}٪ سود در ${faNum(pr.exits.partial)}R، حد ضرر به نقطه‌ی ورود، حد ضرر متحرک ${faNum(pr.exits.trail)}×ATR`);
+  else out.push('خروج ثابت: حد ضرر و هدف');
+  if (pr.costs) out.push('لغزش بر اساس حجم هر ارز و فاندینگ فیوچرز');
+  if (pr.shorts) out.push('شورت روی فیوچرز');
+  if (pr.deriv) out.push('فاندینگ و Open Interest در تحلیل');
+  if (pr.calendar) out.push(`بدون ورود ${faNum(pr.newsMin)} دقیقه دور خبرهای CPI، اشتغال و فدرال رزرو و وقتی بازار اصلی طلا و نفت بسته است`);
+  return out;
 }
 const pnlPills = (st, cap) => `<span class="pill ${st.pnl >= 0 ? 'up' : 'down'} num">${signed(st.pnl)} USDT</span><span class="pill ${st.pnl >= 0 ? 'up' : 'down'} num">${signed(st.pnl / cap * 100)}%</span>`;
 function openList(res) {
@@ -1073,15 +1158,20 @@ function pageBacktest(main) {
       ${verdictCard(st, res.bench)}
       <div class="span-2">${kpiTiles(st, { k: 'بهترین / بدترین', v: `<span class="up">${signed(st.best?.pnl || 0)}</span> / <span class="down">${signed(st.worst?.pnl || 0)}</span>`, s: 'USDT در یک معامله' })}</div>
       <div class="card glass span-2"><h3>منحنی سرمایه</h3><div class="chart-box" id="btChart"></div></div>
+      ${res.closed.length ? `<div class="span-2 grid cols-2">${validationCard(res, S.settings)}${postTradeCard(res)}</div>` : ''}
       <div class="span-2">${accuracyCard(res)}</div>
       <div class="span-2 grid cols-2">${breakdown(st)}</div>
       <div class="span-2">${blockedCard(res)}</div>
       <div class="card glass span-2"><h3>آخرین معاملات بک‌تست <span class="muted"><a href="#trades" id="btAll">همه</a></span></h3><div class="list">${res.closed.slice(-10).reverse().map(x => tradeRow(x)).join('') || '<div class="empty">در این بازه معامله‌ای انجام نشد</div>'}</div></div>
     </div>` : '<div class="card glass"><div class="empty">هنوز بک‌تستی اجرا نشده. بازه را انتخاب کنید و «اجرا» را بزنید.</div></div>'}
     <p class="muted" style="font-size:12px;margin:12px 4px">بک‌تست معمولاً از نتیجه‌ی واقعی خوش‌بینانه‌تر است؛ تست زنده‌ی یک‌هفته‌ای ملاک اصلی است.</p>
+    <div class="sep"></div>
+    ${wfSection()}
   </div>`;
   main.querySelectorAll('[data-days]').forEach(b => b.onclick = () => { B.days = +b.dataset.days; save('btDays', B.days); render(); });
   $('#runBt').onclick = runBacktest;
+  $('#wfBtn').onclick = runWalkForward;
+  $('#wfSave') && ($('#wfSave').onclick = saveWfProfile);
   if (st) {
     const c = createAreaChart($('#btChart'), { base: res.capital }); charts.push(c); c.setData(res.equity, res.capital);
     main.querySelectorAll('.row[data-sym]').forEach(r => r.onclick = () => openDetail(r.dataset.sym));
@@ -1093,17 +1183,21 @@ async function runBacktest() {
   const end = Math.floor(Date.now() / BAR_MS) * BAR_MS;
   const start = end - B.days * DAY;
   const syms = ASSETS.map(a => a.symbol).filter(s => S.settings.symbols[s] && !unavailable.has(s));
-  B.error = ''; B.running = `دریافت داده 0/${syms.length}`; render();
-  const data = {}; let done = 0;
-  await pool(syms, 4, async s => {
-    try { data[s] = await ensureHistory(s, start - (WARMUP_BARS + (S.settings.learn ? Math.round((S.settings.learnWarmDays ?? 3) * 288) : 0)) * BAR_MS, end); } catch { /* */ }
-    done++; B.running = `دریافت داده ${done}/${syms.length}`;
+  const pr = S.settings.pro;
+  const fetchSyms = pr?.regime && !syms.includes('BTCUSDT') ? [...syms, 'BTCUSDT'] : syms;
+  B.error = ''; B.running = `دریافت داده 0/${fetchSyms.length}`; render();
+  const data = {}, dv = {}; let done = 0;
+  const from = start - warmupFor(S.settings) * BAR_MS;
+  await pool(fetchSyms, 4, async s => {
+    try { data[s] = await ensureHistory(s, from, end); } catch { /* */ }
+    if (pr?.deriv && syms.includes(s)) try { dv[s] = await ensureDeriv(s, from, end); } catch { /* */ }
+    done++; B.running = `دریافت داده ${done}/${fetchSyms.length}`;
     const b = $('#runBt'); if (b) b.innerHTML = `<span class="loader"></span> ${B.running}`;
   });
   if (!Object.keys(data).length) { B.running = null; B.error = 'دریافت داده از Binance ممکن نشد. اتصال اینترنت یا VPN را بررسی کنید، یا حالت نمایشی را امتحان کنید.'; S.offline = true; render(); return; }
   B.running = 'اجرای ربات…'; render();
   await new Promise(r => setTimeout(r, 30));
-  const res = closeAllAtEnd(runSimulation({ data, settings: S.settings, start, end }), S.settings);
+  const res = closeAllAtEnd(runSimulation({ data, settings: S.settings, start, end, deriv: pr?.deriv ? dv : null }), S.settings);
   res.bench = benchmark(res, data);
   res.days = B.days;
   res.targetR = S.settings.targetR;
@@ -1111,6 +1205,72 @@ async function runBacktest() {
   res.events = [];
   B.res = res; B.running = null;
   save('bt', res);
+  render();
+}
+
+/* ---------------- walk-forward validator (skill 1) ---------------- */
+const WF = { rep: load('wf', null), running: null, error: '' };
+function wfSection() {
+  const r = WF.rep;
+  const pct = x => `<span class="num ${cls(x)}">${signed(x, 2)}%</span>`;
+  const pfv = x => (x === Infinity ? '∞' : nf(x, 2));
+  const prow = (name, x) => x ? `<tr><td>${name}</td><td class="num">${x.n}</td><td class="num">${nf(x.win, 0)}%</td><td>${pct(x.pnlPct)}</td><td class="num ${x.pf >= 1 ? 'up' : 'down'}">${pfv(x.pf)}</td><td class="num down">${nf(x.dd, 1)}%</td><td class="num">${x.conf.b ? nf(x.conf.b.pPos * 100, 0) + '%' : '—'}</td></tr>` : '';
+  let body = '';
+  if (r) {
+    const b = r.best, P = r.port;
+    const picked = Object.entries(b.gsel).map(([g, l]) => `<b>${GROUPS[g]}</b>: ${l.length ? l.map(k => STRATEGIES[k]?.name || k).join('، ') : 'هیچ (معامله نمی‌شود)'}`).join('<br>');
+    const good = P.opt.out.pnlPct > 0 && P.opt.out.pf > 1.1;
+    body = `<div class="note ${good ? '' : 'warn'}" style="margin:12px 0">${good
+      ? `پروفایل انتخاب‌شده روی ۱۰ روزی که در انتخابش نقشی نداشت سود داد (${signed(P.opt.out.pnlPct, 2)}%). این نشانه‌ی خوبی است، نه تضمین؛ با یک تست زنده‌ی چندروزه هم امتحانش کنید.`
+      : `پروفایل انتخاب‌شده روی ۱۰ روز آخر سود نداد (${signed(P.opt.out.pnlPct, 2)}%). یعنی چیزی که در ۲۰ روز اول خوب بود، ادامه پیدا نکرد. این همان بیش‌برازش (overfitting) است که اعتبارسنجی برای پیدا کردنش ساخته شده.`}</div>
+      <div class="table-wrap"><table class="wf"><thead><tr><th>روی ۱۰ روز آخر (خارج از نمونه)</th><th>معامله</th><th>برد</th><th>بازده</th><th>فاکتور سود</th><th>افت</th><th>احتمال برتری</th></tr></thead><tbody>
+        ${prow('سیستم قبلی', P.now.out)}${prow('میز حرفه‌ای با همه‌ی ستاپ‌ها', P.pro.out)}${prow('پروفایل انتخاب‌شده', P.opt.out)}${prow('همان + تحلیل‌گر و خودآموز', P.optLearn.out)}
+      </tbody></table></div>
+      <div class="table-wrap" style="margin-top:10px"><table class="wf"><thead><tr><th>روی ۲۰ روز اول (داخل نمونه)</th><th>معامله</th><th>برد</th><th>بازده</th><th>فاکتور سود</th><th>افت</th><th>احتمال برتری</th></tr></thead><tbody>
+        ${prow('سیستم قبلی', P.now.in)}${prow('پروفایل انتخاب‌شده', P.opt.in)}
+      </tbody></table></div>
+      <div class="grp-h">انتخاب: کندل ${faNum(b.tf)} دقیقه‌ای، هدف ${faNum(b.tR)}R، خروج ${b.ek === 'fixed' ? 'ثابت' : 'مدیریت‌شده'}، نگه‌داری تا ${faNum(b.hold)} ساعت</div>
+      <div class="muted" style="font-size:12.5px;line-height:2">${picked}</div>
+      <details class="more"><summary>همه‌ی ترکیب‌های امتحان‌شده ▾</summary><div class="table-wrap"><table class="wf"><thead><tr><th>کندل</th><th>هدف</th><th>خروج</th><th>سیگنال انتخابی (۲۰ روز)</th><th>میانگین</th><th>همان‌ها در ۱۰ روز آخر</th><th>میانگین</th></tr></thead><tbody>
+        ${r.cands.map(c => `<tr class="${c.tf === b.tf && c.tR === b.tR && c.ek === b.ek ? 'sel' : ''}"><td class="num">${c.tf}د</td><td class="num">${c.tR}R</td><td>${c.ek === 'fixed' ? 'ثابت' : 'مدیریت‌شده'}</td><td class="num">${c.nIn}</td><td class="num ${cls(c.inR)}">${signed(c.inR, 3)}R</td><td class="num">${c.nOut}</td><td class="num ${cls(c.outR)}">${signed(c.outR, 3)}R</td></tr>`).join('')}
+      </tbody></table></div></details>
+      <div class="hero-actions"><button class="btn primary" id="wfSave" ${b.nIn ? '' : 'disabled'}>ذخیره به‌عنوان پروفایل «سودمحور»</button></div>
+      <p class="muted" style="font-size:12px;margin:8px 0 0">اجرا شده در ${fdt(r.at)} روی ${faNum(r.days)} روز گذشته. همه‌ی اعداد بعد از کارمزد، لغزش و فاندینگ.</p>`;
+  }
+  return `<div class="card glass"><h3>اعتبارسنجی Walk-forward <span class="muted">مهارت ۱</span></h3>
+    <p class="muted" style="margin:4px 0 12px;line-height:1.9">۱۲ ترکیب (کندل ۵، ۱۵ و ۳۰ دقیقه × هدف ۲R و ۳R × خروج ثابت و مدیریت‌شده) روی ۳۰ روز گذشته‌ی Binance امتحان می‌شود. انتخاب فقط با ۲۰ روز اول انجام می‌شود و ستاپ‌هایی نگه داشته می‌شوند که روی هر گروه دارایی سود دادند. بعد نتیجه روی ۱۰ روز آخر، که در انتخاب نقشی نداشت، سنجیده می‌شود. چند دقیقه طول می‌کشد.</p>
+    <button class="btn ${r ? '' : 'primary'}" id="wfBtn" ${WF.running ? 'disabled' : ''}>${WF.running ? `<span class="loader"></span> ${WF.running}` : `${I.play} ${r ? 'اجرای دوباره' : 'شروع اعتبارسنجی'}`}</button>
+    ${WF.error ? `<div class="note warn" style="margin-top:12px">${WF.error}</div>` : ''}${body}</div>`;
+}
+async function runWalkForward() {
+  if (WF.running) return;
+  const end = Math.floor(Date.now() / BAR_MS) * BAR_MS, days = 30;
+  const from = end - days * DAY - wfWarmupBars() * BAR_MS;
+  const syms = ASSETS.map(a => a.symbol).filter(s => S.settings.symbols[s] && !unavailable.has(s));
+  const all = syms.includes('BTCUSDT') ? syms : [...syms, 'BTCUSDT'];
+  const upd = msg => { WF.running = msg; const b = $('#wfBtn'); if (b) b.innerHTML = `<span class="loader"></span> ${msg}`; };
+  WF.error = ''; upd('دریافت داده'); render();
+  const data = {}, dv = {}; let done = 0;
+  await pool(all, 4, async s => {
+    for (let k = 0; k < 3 && !data[s]; k++) { try { data[s] = await ensureHistory(s, from, end); } catch { await new Promise(r => setTimeout(r, 2000)); } }
+    if (syms.includes(s)) try { dv[s] = await ensureDeriv(s, from, end); } catch { /* */ }
+    done++; upd(`دریافت داده ${done}/${all.length}`);
+  });
+  if (Object.keys(data).length < 5) { WF.running = null; WF.error = 'دریافت داده از Binance ممکن نشد.'; render(); return; }
+  try {
+    const base = { ...deep(S.settings), symbols: Object.fromEntries(ASSETS.map(a => [a.symbol, syms.includes(a.symbol)])) };
+    const rep = await walkForward({ data, deriv: dv, base, end, days, onProgress: (k, n, msg) => upd(`${k}/${n} · ${msg}`) });
+    WF.rep = rep; save('wf', rep);
+  } catch (e) { WF.error = 'اعتبارسنجی کامل نشد: ' + esc(e.message || e); }
+  WF.running = null; render();
+}
+function saveWfProfile() {
+  const r = WF.rep; if (!r) return;
+  const b = r.best;
+  const desc = `از اعتبارسنجی ${fdt(r.at)}: کندل ${faNum(b.tf)} دقیقه‌ای، هدف ${faNum(b.tR)}R، فقط ستاپ‌های سودده هر گروه`;
+  save('optProfile', { desc, set: r.set, at: r.at });
+  PROFILES.profit.desc = desc; PROFILES.profit.set = deep(r.set);
+  toast('پروفایل «سودمحور» به‌روز شد. تست تازه با این پروفایل بسازید.');
   render();
 }
 
@@ -1149,10 +1309,22 @@ function pageSettings(main) {
         ${num('feeSpotPct', 'کارمزد اسپات (% هر طرف)', 'Binance: ۰.۱٪ taker', 0.01, 0, 1)}
         ${num('feeFuturesPct', 'کارمزد فیوچرز (% هر طرف)', 'Binance: ۰.۰۵٪ taker', 0.01, 0, 1)}
         ${num('slippagePct', 'لغزش قیمت (% هر پر شدن)', 'فاصله‌ی قیمت اجرا با قیمت دیده‌شده', 0.01, 0, 1)}
+        ${num('maxCostR', 'سقف کارمزد نسبت به ریسک', 'اگر کارمزد و لغزش بیشتر از این کسر از ریسک معامله باشد، معامله انجام نمی‌شود (۰.۲ یعنی ۲۰٪)', 0.05, 0.05, 2)}
         ${sw('analyst', 'تحلیل‌گر چارت', 'قبل از هر ورود، چارت با چک‌لیست مهارت تحلیل‌گر امتیاز می‌گیرد (پیش‌فرض تست‌های تازه)', st.analyst)}
         ${sw('learn', 'خودآموز (حافظه‌ی تجربه)', 'از نتیجه‌ی هر سیگنال یاد می‌گیرد و تصمیم‌های بعدی را با آن می‌گیرد', st.learn)}
         ${sw('timeMachineFilter', 'فیلتر ماشین زمان', 'قبل از هر ورود ۴۰۰ بار شبیه‌سازی؛ اگر شانس از سربه‌سر کمتر بود رد می‌شود', st.timeMachineFilter)}
         ${num('tmMinEdge', 'حداقل برتری ماشین زمان (واحد درصد)', 'نسبت به نقطه‌ی سربه‌سر', 1, -50, 50)}
+      </div>
+      <div class="card glass"><h3>میز حرفه‌ای <span class="muted">۱۰ مهارت معامله‌گری، برای تست‌های تازه</span></h3>
+        ${sw('on', 'میز حرفه‌ای', 'خاموش = مثل نسخه‌ی قبل', !!st.pro, 'data-pro')}
+        ${st.pro ? `<div class="field"><div class="lbl"><b>تایم‌فریم سیگنال</b><span>کندل بزرگ‌تر = حد ضرر بزرگ‌تر و سهم کمتر کارمزد. خروج‌ها همچنان هر ۵ دقیقه بررسی می‌شوند.</span></div><div class="seg">${[5, 15, 30, 60].map(m => `<button data-tf="${m}" class="${st.pro.tf === m ? 'active' : ''}">${faNum(m)}د</button>`).join('')}</div></div>
+        ${sw('regime', 'حالت بازار', 'ستاپ‌های روندی فقط در روند، برگشتی فقط در رنج؛ بیت‌کوین رهبر بازار رمزارز', st.pro.regime, 'data-pro')}
+        ${sw('risk', 'ریسک پرتفوی', 'سقف پوزیشن هم‌جهت در هر گروه، سقف ریسک باز، ترمز افت سرمایه و نصف کردن ریسک بعد از باخت‌های پشت سر هم', !!st.pro.risk, 'data-pro')}
+        ${sw('exits', 'خروج مدیریت‌شده', 'نیمی از سود در ۱R، حد ضرر به نقطه‌ی ورود، حد ضرر متحرک', !!st.pro.exits, 'data-pro')}
+        ${sw('costs', 'هزینه‌ی واقعی اجرا', 'لغزش بیشتر برای ارزهای کم‌حجم، فاندینگ برای فیوچرز', st.pro.costs, 'data-pro')}
+        ${sw('shorts', 'شورت روی فیوچرز', 'در روند نزولی هم معامله می‌کند (فقط بازار فیوچرز)', st.pro.shorts, 'data-pro')}
+        ${sw('deriv', 'داده‌ی فیوچرز', 'نرخ فاندینگ و Open Interest در تحلیل هر سیگنال', st.pro.deriv, 'data-pro')}
+        ${sw('calendar', 'تقویم و ساعت', 'بدون ورود نزدیک CPI، اشتغال و فدرال رزرو و وقتی بازار اصلی طلا و نفت بسته است', st.pro.calendar, 'data-pro')}` : ''}
       </div>
       <div class="card glass"><h3>ستاپ‌ها <span class="muted">پیش‌فرض تست‌های تازه و بک‌تست</span></h3>
         ${[['trader', 'از مهارت‌های تریدر'], ['chart', 'از مهارت تحلیل‌گر چارت']].map(([src, title]) => `<div class="grp-h">${title}</div>` + Object.entries(STRATEGIES).filter(([, s]) => s.src === src).map(([k, s]) => sw(k, s.name, `<span class="tag fam">${FAMILIES[s.family]}</span> ${s.desc}`, st.strategies[k], 'data-strat')).join('')).join('')}
@@ -1182,6 +1354,14 @@ function pageSettings(main) {
     persist(); toast('ذخیره شد');
   });
   main.querySelectorAll('input[data-strat]').forEach(inp => inp.onchange = () => { S.settings.strategies[inp.dataset.strat] = inp.checked; persist(); });
+  main.querySelectorAll('input[data-pro]').forEach(inp => inp.onchange = () => {
+    const k = inp.dataset.pro;
+    if (k === 'on') S.settings.pro = inp.checked ? deep(PRO_DEFAULTS) : null;
+    else if (k === 'risk' || k === 'exits') S.settings.pro[k] = inp.checked ? deep(PRO_DEFAULTS[k]) : null;
+    else S.settings.pro[k] = inp.checked;
+    persist(); render(); toast('ذخیره شد');
+  });
+  main.querySelectorAll('[data-tf]').forEach(b => b.onclick = () => { S.settings.pro.tf = +b.dataset.tf; persist(); render(); });
   main.querySelectorAll('input[data-sym-t]').forEach(inp => inp.onchange = () => { S.settings.symbols[inp.dataset.symT] = inp.checked; persist(); });
   const grp = (g, on) => { ASSETS.filter(a => a.group === g).forEach(a => { S.settings.symbols[a.symbol] = on; }); persist(); render(); };
   main.querySelectorAll('[data-grp-on]').forEach(b => b.onclick = e => { e.preventDefault(); grp(b.dataset.grpOn, true); });

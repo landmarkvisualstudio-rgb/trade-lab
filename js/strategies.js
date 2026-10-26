@@ -12,6 +12,8 @@ const cache = new WeakMap();
 export function prepare(series) {
   if (cache.has(series)) return cache.get(series);
   const { t, o, h, l, c, v } = series;
+  // 5-minute bars unless the series was resampled to a higher timeframe (see resample)
+  const barMs = series.barMs || BAR_MS, htfMs = series.htfMs || 3600000;
   const idx = new Map();
   for (let i = 0; i < t.length; i++) idx.set(t[i], i);
   const sma20 = sma(c, 20), sd20 = stdev(c, 20);
@@ -30,19 +32,20 @@ export function prepare(series) {
     bbU, bbL, bw, hiH55: priorMax(h, 55), loL55: priorMin(l, 55),
     lowIdx, highIdx, pk: piv.k,
     // for the analyst: hourly trend, trend efficiency, room to the 100-bar extremes
-    ...hourlyEma(t, c, 20), er20: effRatio(c, 20), hiH100: priorMax(h, 100), loL100: priorMin(l, 100),
+    ...hourlyEma(t, c, 20, barMs, htfMs), er20: effRatio(c, 20), hiH100: priorMax(h, 100), loL100: priorMin(l, 100),
+    barMs,
   };
   cache.set(series, p);
   return p;
 }
 
 // EMA of hourly closes (built from the 5-minute bars), known only once the hour closed
-function hourlyEma(t, c, n) {
+function hourlyEma(t, c, n, barMs = BAR_MS, htfMs = 3600000) {
   const htf = new Array(c.length).fill(NaN), htfSlope = new Array(c.length).fill(NaN);
   const k = 2 / (n + 1), hist = [];
   let e = NaN, cnt = 0, sum = 0;
   for (let i = 0; i < c.length; i++) {
-    if ((t[i] + BAR_MS) % 3600000 === 0) {
+    if ((t[i] + barMs) % htfMs === 0) {
       cnt++;
       if (cnt <= n) { sum += c[i]; if (cnt === n) e = sum / n; } else e = c[i] * k + e * (1 - k);
       if (!isNaN(e)) hist.push(e);
@@ -70,7 +73,30 @@ export function lastPivots(arr, i, k, n) {
   while (lo <= hi) { const m = (lo + hi) >> 1; if (arr[m] <= i - k) { pos = m; lo = m + 1; } else hi = m - 1; }
   return pos < 0 ? [] : arr.slice(Math.max(0, pos - n + 1), pos + 1);
 }
-const barOfDay = (p, i) => Math.floor((p.t[i] % DAY) / BAR_MS);
+// the first half hour of the UTC day (the daily VWAP is still settling)
+const earlyInDay = (p, i) => p.t[i] % DAY < 30 * 60000;
+
+// Higher timeframe bars built from 5-minute bars (skill 5). A bar is kept only once
+// its last 5-minute bar exists, so an unfinished bar is never traded on. htfMs is
+// the timeframe the analyst uses as "the trend above".
+const rsCache = new WeakMap();
+export function resample(s, tfMs, htfMs) {
+  let m = rsCache.get(s);
+  if (!m) { m = new Map(); rsCache.set(s, m); }
+  const key = tfMs + ':' + htfMs;
+  if (m.has(key)) return m.get(key);
+  const out = { t: [], o: [], h: [], l: [], c: [], v: [], barMs: tfMs, htfMs };
+  let cur = null;
+  const flush = () => { if (cur && cur.last === cur.T + tfMs - BAR_MS) { out.t.push(cur.T); out.o.push(cur.o); out.h.push(cur.h); out.l.push(cur.l); out.c.push(cur.c); out.v.push(cur.v); } };
+  for (let i = 0; i < s.t.length; i++) {
+    const T = Math.floor(s.t[i] / tfMs) * tfMs;
+    if (!cur || cur.T !== T) { flush(); cur = { T, o: s.o[i], h: s.h[i], l: s.l[i], c: s.c[i], v: s.v[i], last: s.t[i] }; }
+    else { cur.h = Math.max(cur.h, s.h[i]); cur.l = Math.min(cur.l, s.l[i]); cur.c = s.c[i]; cur.v += s.v[i]; cur.last = s.t[i]; }
+  }
+  flush();
+  m.set(key, out);
+  return out;
+}
 
 /* ---------- from the trader skills ---------- */
 
@@ -84,11 +110,13 @@ function orb(p, i, dir, state) {
     if (ti >= start) { s = { ...SESSIONS_UTC_MIN[k], start }; break; }
   }
   if (!s) return null;
-  const rangeEnd = s.start + 3 * BAR_MS;
+  // the opening range is the first 15 minutes (one bar on a higher timeframe)
+  const bm = p.barMs || BAR_MS, nb = Math.max(1, Math.round(15 * 60000 / bm));
+  const rangeEnd = s.start + nb * bm;
   if (ti < rangeEnd || ti >= rangeEnd + 2 * 3600000) return null;
   const key = `${s.start}:${dir}`;
   if (state.orbDone.has(key)) return null;
-  const ids = [0, 1, 2].map(k => p.idx.get(s.start + k * BAR_MS));
+  const ids = Array.from({ length: nb }, (_, k) => p.idx.get(s.start + k * bm));
   if (ids.some(x => x === undefined)) return null;
   const rh = Math.max(...ids.map(x => p.h[x])), rl = Math.min(...ids.map(x => p.l[x]));
   const broke = dir > 0 ? p.c[i] > rh : p.c[i] < rl;
@@ -194,7 +222,7 @@ function bbSqueeze(p, i, dir) {
 // Intraday: VWAP reclaim. Below VWAP for 15 minutes, then a strong close above it
 // on volume, with at least half the body above VWAP.
 function vwapReclaim(p, i, dir) {
-  if (dir < 0 || i < 30 || barOfDay(p, i) < 6) return null;
+  if (dir < 0 || i < 30 || earlyInDay(p, i)) return null;
   const vw = p.vw.vwap;
   if (!(p.c[i - 3] < vw[i - 3] && p.c[i - 2] < vw[i - 2] && p.c[i - 1] < vw[i - 1])) return null;
   const body = p.c[i] - p.o[i];
@@ -204,7 +232,7 @@ function vwapReclaim(p, i, dir) {
 
 // Mean reversion: a reversal candle at the VWAP −2σ band (+2σ for a short).
 function vwapDev(p, i, dir) {
-  if (i < 30 || barOfDay(p, i) < 6 || !(p.vw.sd[i] > 0)) return null;
+  if (i < 30 || earlyInDay(p, i) || !(p.vw.sd[i] > 0)) return null;
   const band = p.vw.vwap[i] - dir * 2 * p.vw.sd[i];
   const o = p.o[i], c = p.c[i], h = p.h[i], l = p.l[i], body = Math.abs(c - o), range = h - l || 1e-12;
   if (dir > 0) {

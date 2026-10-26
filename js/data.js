@@ -115,6 +115,42 @@ export async function ensureHistory(symbol, from, to) {
   return toSeries(rows.filter(r => r[0] >= from && r[0] < to));
 }
 
+// Futures positioning for the analyst (skill 8): funding-rate history and hourly
+// open interest, cached on the device like the candles. Binance keeps only the
+// last 30 days of open interest. Liquidations and the order book have no public
+// history, so tests can't use them.
+const FUT_NAME = { PEPEUSDT: '1000PEPEUSDT' };
+export async function ensureDeriv(symbol, from, to) {
+  if (mode.demo) return null;
+  const fs = FUT_NAME[symbol] || symbol;
+  const key = `dv:${symbol}`;
+  const old = (await idbGet(key)) || { fund: [], oi: [], none: 0 };
+  if (old.none && Date.now() - old.none < 86400000) return null; // no futures market: asked again tomorrow
+  const keepFrom = Math.min(from, Date.now() - 40 * 86400000);
+  let fund = old.fund.filter(r => r[0] >= keepFrom), oi = old.oi.filter(r => r[0] >= keepFrom);
+  try {
+    const fFrom = fund.length && fund[0][0] <= from + 8 * 3600000 ? fund[fund.length - 1][0] + 1 : from - 8 * 3600000;
+    if (fFrom < to) {
+      const rows = await getJSON('futures', '/fapi/v1/fundingRate', { symbol: fs, startTime: fFrom, endTime: to, limit: 1000 });
+      fund = mergeRows(fund, rows.map(r => [+r.fundingTime, +r.fundingRate]));
+    }
+    const oiMin = Date.now() - 29.5 * 86400000;
+    let oFrom = oi.length && oi[0][0] <= Math.max(from, oiMin) + 2 * 3600000 ? oi[oi.length - 1][0] + 1 : Math.max(from - 8 * 3600000, oiMin);
+    for (let guard = 0; guard < 4 && oFrom < to - 3600000; guard++) {
+      const rows = await getJSON('futures', '/futures/data/openInterestHist', { symbol: fs, period: '1h', startTime: oFrom, endTime: Math.min(to, oFrom + 499 * 3600000), limit: 500 });
+      if (!rows.length) break;
+      oi = mergeRows(oi, rows.map(r => [+r.timestamp, +r.sumOpenInterestValue]));
+      oFrom = +rows[rows.length - 1].timestamp + 1;
+      if (rows.length < 500) break;
+    }
+  } catch (e) {
+    if (e instanceof BadSymbol) { await idbSet(key, { fund: [], oi: [], none: Date.now() }); return null; }
+    if (!fund.length && !oi.length) throw e;
+  }
+  await idbSet(key, { fund, oi, none: 0 });
+  return { fund, oi };
+}
+
 function mergeRows(a, b) {
   const m = new Map();
   for (const r of a) m.set(r[0], r);

@@ -31,9 +31,13 @@ function read(L, key) {
   const w = s.w * d, r = s.r * d;
   return { w, mean: r / (w + SHRINK), raw: w > 0 ? r / w : 0, cnt: s.cnt, winRate: w > 0 ? s.wv * d / w * 100 : 0 };
 }
-const keysOf = o => ({
-  setup: `S|${o.setup}`, group: `G|${o.setup}|${o.group}`, grade: `A|${o.grade}`, symbol: `Y|${o.symbol}`,
-});
+const keysOf = o => {
+  const k = { setup: `S|${o.setup}`, group: `G|${o.setup}|${o.group}`, grade: `A|${o.grade}`, symbol: `Y|${o.symbol}` };
+  // newer tests also remember the market regime and the trading session (skills 2 and 9)
+  if (o.reg) k.reg = `Q|${o.setup}|${o.reg}`;
+  if (o.session) k.session = `T|${o.group}|${o.session}`;
+  return k;
+};
 
 // a resolved signal becomes a lesson
 export function learn(L, o) {
@@ -62,7 +66,10 @@ export function judge(L, o, opts = LEARN_DEFAULTS) {
   const g = read(L, k.group), s = read(L, k.setup), a = read(L, k.grade), y = read(L, k.symbol), all = read(L, 'ALL');
   // a weighted blend: the most specific context counts most once it has enough lessons
   const wg = Math.min(1, g.w / 12) * 0.45, ws = 0.25, wa = 0.15, wy = Math.min(1, y.w / 10) * 0.15;
-  const base = (g.mean * wg + s.mean * ws + a.mean * wa + y.mean * wy) / (wg + ws + wa + wy);
+  let num = g.mean * wg + s.mean * ws + a.mean * wa + y.mean * wy, den = wg + ws + wa + wy;
+  if (k.reg) { const q = read(L, k.reg), wq = Math.min(1, q.w / 12) * 0.3; num += q.mean * wq; den += wq; }
+  if (k.session) { const z = read(L, k.session), wz = Math.min(1, z.w / 15) * 0.15; num += z.mean * wz; den += wz; }
+  const base = num / den;
   let fx = 0;
   if (o.ana) { const fw = factorWeights(L); for (const [f, v] of Object.entries(o.ana.f)) fx += (fw[f] || 0) * v; }
   // factor weights are learned one by one and overlap, so their sum is damped and capped
@@ -81,5 +88,13 @@ export function summary(L, setups, groups) {
     if (!r.cnt) continue;
     rows.push({ setup: s, group: g, n: r.cnt, w: r.w, avgR: r.raw, est: r.mean, winRate: r.winRate });
   }
-  return { lessons: L.lessons, ready: L.lessons >= READY, weights: factorWeights(L), rows, overall: read(L, 'ALL').raw, history: L.history };
+  const ctx = [];
+  for (const key of Object.keys(L.stats)) {
+    if (key[0] !== 'Q' && key[0] !== 'T') continue;
+    const r = read(L, key), [, a, b] = key.split('|');
+    if (r.cnt >= 8) ctx.push({ kind: key[0] === 'Q' ? 'regime' : 'session', a, b, n: r.cnt, avgR: r.raw, est: r.mean, winRate: r.winRate });
+  }
+  const weights = factorWeights(L);
+  for (const f of Object.keys(weights)) if (!L.stats[`F|${f}|1`] && !L.stats[`F|${f}|-1`] && !L.stats[`F|${f}|0`]) delete weights[f];
+  return { lessons: L.lessons, ready: L.lessons >= READY, weights, rows, ctx, overall: read(L, 'ALL').raw, history: L.history };
 }

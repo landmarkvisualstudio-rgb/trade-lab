@@ -15,10 +15,13 @@ export const FACTORS = {
   room: 'فضا تا مقاومت',
   regime: 'حالت بازار',
   agree: 'تأیید ستاپ‌های دیگر',
+  // derivatives positioning (skill 8), only for tests that use it
+  crowd: 'شلوغی معامله (فاندینگ)',
+  oi: 'پول تازه (Open Interest)',
 };
 const REVERSAL = new Set(['meanrev', 'reversal']);
 
-export function analyze(p, i, sig, S) {
+export function analyze(p, i, sig, S, dx) {
   const dir = sig.dir;
   const fam = STRATEGIES[sig.setup]?.family || 'trend';
   const contrarian = REVERSAL.has(fam) || sig.setup === 'engulfing';
@@ -73,6 +76,23 @@ export function analyze(p, i, sig, S) {
   const ag = sig.agree?.length || 0;
   f.agree = ag >= 1 ? 1 : 0;
   note.agree = ag ? `${ag} ستاپ دیگر هم‌نظر` : 'ستاپ تنها';
+
+  // 9-10) futures positioning: who is crowded, and is new money backing the move
+  if (dx) {
+    const fr = dx.fund;
+    if (fr == null) { f.crowd = 0; note.crowd = 'فاندینگ نامعلوم'; }
+    else {
+      const crowdedLong = fr > 0.0003, crowdedShort = fr < -0.0001;
+      f.crowd = dir > 0 ? (crowdedLong ? -1 : crowdedShort ? 1 : 0) : (crowdedShort ? -1 : crowdedLong ? 1 : 0);
+      note.crowd = `فاندینگ ${(fr * 100).toFixed(3)}٪` + (crowdedLong ? ' (خریدارها شلوغ)' : crowdedShort ? ' (فروشنده‌ها شلوغ)' : '');
+    }
+    if (dx.oiChg == null) { f.oi = 0; note.oi = 'OI نامعلوم'; }
+    else {
+      const moveWith = dx.pxChg * dir > 0;
+      f.oi = Math.abs(dx.oiChg) < 0.01 ? 0 : dx.oiChg > 0 ? (moveWith ? 1 : -1) : 0;
+      note.oi = `OI ۶ ساعت ${dx.oiChg >= 0 ? '+' : ''}${(dx.oiChg * 100).toFixed(1)}٪`;
+    }
+  }
 
   const score = Object.values(f).reduce((a, x) => a + x, 0);
   const grade = score >= 4 ? 'A' : score >= 2 ? 'B' : score >= 0 ? 'C' : 'D';

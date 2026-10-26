@@ -131,6 +131,33 @@ export const DEFAULT_SETTINGS = {
   learnWarmDays: 3,           // days of history watched before the start, to begin with experience
   minScore: 0,                // analyst score needed while the memory is still young
   maxCostR: 0.2,              // refuse a trade whose fees + slippage exceed this share of its risk
+  pro: null,                  // the pro desk (filled in below); tests made before it have none
+};
+
+// The pro desk (version 7): ten trading skills on top of the scanner. Every part can
+// be switched off on its own. See engine.js.
+export const PRO_DEFAULTS = {
+  tf: 15,             // skill 5: signals on 15-minute bars (5 = the old behaviour); exits still checked every 5 minutes
+  regime: true,       // skill 2: each setup only in the market regime it suits, bitcoin as the crypto leader
+  risk: { maxCluster: 3, maxRiskPct: 3, ddHalf: 6, ddStop: 12, streak: 3 }, // skill 3: portfolio risk
+  exits: { partial: 1, partialPct: 50, be: 1, trail: 2, trailFrom: 1.5 },   // skill 4: half off at 1R, stop to break-even, ATR trail
+  costs: true,        // skill 6: slippage by liquidity, funding on futures
+  shorts: true,       // skill 7: shorts on futures markets
+  deriv: true,        // skill 8: funding rate and open interest in the analysis
+  calendar: true,     // skill 9: no new trades around US CPI / jobs / FOMC, or while gold and oil markets are shut
+  newsMin: 30,        // minutes before and after a release
+};
+DEFAULT_SETTINGS.pro = JSON.parse(JSON.stringify(PRO_DEFAULTS));
+
+// The "profit" profile. Picked by the walk-forward validator (skill 1) on real
+// Binance data: chosen on the first 20 days, checked on the last 10.
+export const OPTIMIZED = {
+  desc: 'میز حرفه‌ای: تایم‌فریم ۱۵ دقیقه، خروج مدیریت‌شده، ریسک ۰.۷۵٪',
+  set: {
+    targetR: 2.5, maxHoldHours: 8, riskPct: 0.75, maxOpen: 5, maxPositionPct: 25, cooldownBars: 12,
+    maxTradesPerDay: 30, dailyLossPct: 3, maxCostR: 0.15, groupStrategies: null,
+    pro: JSON.parse(JSON.stringify(PRO_DEFAULTS)),
+  },
 };
 
 export const WARMUP_BARS = 300;
