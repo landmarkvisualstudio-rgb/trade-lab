@@ -1,8 +1,8 @@
 // Offline shell: the app works without a connection; market data always comes live.
-const VERSION = 'tradelab-v6';
+const VERSION = 'tradelab-v7';
 const SHELL = ['./', 'index.html', 'css/app.css', 'manifest.webmanifest',
   'js/app.js', 'js/config.js', 'js/engine.js', 'js/strategies.js', 'js/indicators.js', 'js/timemachine.js',
-  'js/data.js', 'js/store.js', 'js/chart.js', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/favicon.svg', 'js/demo.js', 'js/analyst.js', 'js/learner.js'];
+  'js/data.js', 'js/store.js', 'js/chart.js', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/favicon.svg', 'js/demo.js', 'js/analyst.js', 'js/regime.js', 'js/calendar.js', 'js/validate.js', 'js/learner.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== VERSION).map(k => caches.delete(k)))).then(() => self.clients.claim()));
