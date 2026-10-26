@@ -149,14 +149,17 @@ export const PRO_DEFAULTS = {
 };
 DEFAULT_SETTINGS.pro = JSON.parse(JSON.stringify(PRO_DEFAULTS));
 
-// The "profit" profile. Picked by the walk-forward validator (skill 1) on real
-// Binance data: chosen on the first 20 days, checked on the last 10.
+// The "profit" profile, from the walk-forward validator (skill 1) on 30 days of real
+// Binance data (26 Oct 2026). On the last 10 days, which played no part in the choice,
+// 30-minute signals with managed exits lost the least (about -2.5% to -6%, against -24%
+// for the old desk). No setting made a steady profit on fresh data, so risk is kept
+// small and the experience memory decides what to skip.
 export const OPTIMIZED = {
-  desc: 'میز حرفه‌ای: تایم‌فریم ۱۵ دقیقه، خروج مدیریت‌شده، ریسک ۰.۷۵٪',
+  desc: 'کم‌ضررترین ترکیب در اعتبارسنجی: کندل ۳۰ دقیقه، خروج مدیریت‌شده، هدف ۳R، ریسک ۰.۵٪',
   set: {
-    targetR: 2.5, maxHoldHours: 8, riskPct: 0.75, maxOpen: 5, maxPositionPct: 25, cooldownBars: 12,
+    targetR: 3, maxHoldHours: 12, riskPct: 0.5, maxOpen: 5, maxPositionPct: 25, cooldownBars: 12,
     maxTradesPerDay: 30, dailyLossPct: 3, maxCostR: 0.15, groupStrategies: null,
-    pro: JSON.parse(JSON.stringify(PRO_DEFAULTS)),
+    pro: { ...JSON.parse(JSON.stringify(PRO_DEFAULTS)), tf: 30 },
   },
 };
 
