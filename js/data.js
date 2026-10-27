@@ -163,6 +163,54 @@ export async function ensureDeriv(symbol, from, to) {
   return { fund, oi };
 }
 
+// Hourly spot candles for the momentum rotation (skill: many coins, slow trading).
+// Always the spot market, which Binance serves without a VPN through data-api.
+const H1 = 3600000;
+export async function ensureHourly(symbol, from, to) {
+  if (mode.demo) {
+    const out = [];
+    for (let cur = from, g = 0; cur < to && g < 10; g++) { const r = demoKlines(symbol, '1h', { startTime: cur, endTime: to - 1, limit: 1000 }); if (!r.length) break; out.push(...r); cur = r[r.length - 1][0] + H1; }
+    return toSeries(out.filter(x => x[0] + H1 <= Date.now()));
+  }
+  const key = `h1:${symbol}`;
+  let rows = ((await idbGet(key)) || []).filter(r => r[0] >= Math.min(from, Date.now() - 100 * 86400000));
+  const page = async (a, b) => {
+    const out = [];
+    for (let cur = a, g = 0; cur < b && g < 10; g++) {
+      const r = await getJSON('spot', PATHS.spot.klines, { symbol, interval: '1h', startTime: cur, endTime: b - 1, limit: 1000 });
+      if (!r.length) break;
+      for (const x of r) out.push([x[0], +x[1], +x[2], +x[3], +x[4], +x[5]]);
+      cur = r[r.length - 1][0] + H1;
+      if (r.length < 1000) break;
+    }
+    return out.filter(x => x[0] + H1 <= Date.now());
+  };
+  try {
+    if (!rows.length || rows[0][0] > from + H1) rows = mergeRows(await page(from, rows.length ? rows[0][0] : to), rows);
+    const last = rows.length ? rows[rows.length - 1][0] : from - H1;
+    if (last + 2 * H1 <= to) rows = mergeRows(rows, await page(last + H1, to));
+    stale.delete(symbol);
+  } catch (e) {
+    const have = rows.filter(r => r[0] >= from && r[0] < to);
+    if (!have.length || e instanceof BadSymbol) throw e;
+    stale.set(symbol, have[have.length - 1][0] + H1);
+    return toSeries(have);
+  }
+  await idbSet(key, rows);
+  return toSeries(rows.filter(r => r[0] >= from && r[0] < to));
+}
+
+// The most traded coins on Binance spot right now (no stablecoins, fiat or leveraged tokens)
+const NOT_COINS = /^(USDC|FDUSD|TUSD|USDP|DAI|BUSD|EUR|EURI|AEUR|USD1|USDE|XUSD|PAX|UST|USTC|GBP|TRY|BRL|ZAR|PLN|RON|ARS|JPY|IDRT|BIDR|BVND|UAH|NGN|RUB|AUD|WBTC|WBETH|BFUSD|RLUSD|PYUSD|USDS|FRAX|LUSD|GUSD|SUSD|EURC|BNSOL)USDT$/;
+export async function spotUniverse(n = 200) {
+  if (mode.demo) return Object.keys((await import('./config.js')).assetBySymbol).slice(0, n);
+  const all = await getJSON('spot', PATHS.spot.ticker, {});
+  const uni = all.filter(x => x.symbol.endsWith('USDT') && !NOT_COINS.test(x.symbol) && !/(UP|DOWN|BULL|BEAR)USDT$/.test(x.symbol) && +x.quoteVolume > 0 && +x.count > 1000)
+    .sort((a, b) => b.quoteVolume - a.quoteVolume).slice(0, n).map(x => x.symbol);
+  if (!uni.includes('BTCUSDT')) uni.unshift('BTCUSDT');
+  return uni;
+}
+
 function mergeRows(a, b) {
   const m = new Map();
   for (const r of a) m.set(r[0], r);

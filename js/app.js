@@ -1,6 +1,7 @@
 import { ASSETS, GROUPS, STRATEGIES, FAMILIES, DEFAULT_SETTINGS, BAR_MS, WARMUP_BARS, OPTIMIZED, PRO_DEFAULTS, assetBySymbol } from './config.js';
 import { runSimulation, closeAllAtEnd, computeStats, signalStats, BLOCK_REASONS } from './engine.js';
-import { ensureHistory, ensureDeriv, klines, tickers, liveStream, pool, unavailable, stale, netState, toSeries, mode, probe } from './data.js';
+import { ensureHistory, ensureDeriv, ensureHourly, spotUniverse, klines, tickers, liveStream, pool, unavailable, stale, netState, toSeries, mode, probe } from './data.js';
+import { runRotation, pickRotation, ROT_WARM_H } from './rotation.js';
 import { confidence, walkForward, wfWarmupBars } from './validate.js';
 import { REGIME_NAMES } from './regime.js';
 import { SESSION_NAMES } from './calendar.js';
@@ -58,7 +59,7 @@ function dur(ms) {
   if (h) return `${h} ساعت و ${m} دقیقه`;
   return `${m} دقیقه`;
 }
-const REASON = { target: 'هدف', stop: 'حد ضرر', trail: 'حد ضرر جابه‌جاشده', time: 'پایان زمان', end: 'پایان تست' };
+const REASON = { target: 'هدف', stop: 'حد ضرر', trail: 'حد ضرر جابه‌جاشده', time: 'پایان زمان', end: 'پایان تست', rotate: 'از گروه برتر خارج شد', market: 'بیت‌کوین نزولی شد' };
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 /* ---------------- icons ---------------- */
@@ -149,16 +150,19 @@ function render() {
 
 /* ---------------- shared pieces ---------------- */
 function coin(sym, size = 38) {
-  const a = assetBySymbol[sym] || { short: sym.slice(0, 3), color: '#456' };
+  const a = assetBySymbol[sym] || { short: sym.replace(/USDT$/, ''), color: colorOf(sym) };
   return `<span class="coin" style="background:linear-gradient(145deg, ${a.color}, ${shade(a.color)});width:${size}px;height:${size}px">${esc(a.short.slice(0, 4))}</span>`;
 }
+function colorOf(sym) { let h = 0; for (const ch of sym) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return '#' + (0x335577 + (h % 0x8899aa)).toString(16).padStart(6, '0').slice(0, 6); }
+const coinName = s => assetBySymbol[s]?.name || s.replace(/USDT$/, '');
+const setupName = k => STRATEGIES[k]?.name || (k === 'momentum' ? 'چرخش مومنتوم' : k);
 function shade(hex) { const n = parseInt(hex.slice(1), 16); const f = v => Math.max(0, Math.round(v * 0.62)); return `rgb(${f(n >> 16)},${f((n >> 8) & 255)},${f(n & 255)})`; }
 
 function kpiTiles(st, extra = {}) {
   const pf = st.profitFactor === Infinity ? '∞' : nf(st.profitFactor, 2);
   return `<div class="kpis">
     <div class="kpi glass flat"><div class="k">معاملات بسته / باز</div><div class="v num">${st.n} <span class="muted" style="font-size:15px">/ ${st.openCount}</span></div><div class="s">${st.wins} برد · ${st.losses} باخت</div></div>
-    <div class="kpi glass flat"><div class="k">نرخ برد</div><div class="v num">${nf(st.winRate, 1)}%</div><div class="s">${st.n ? `سربه‌سر با هدف ${extra.R || S.settings.targetR}R: ${nf(100 / (1 + (extra.R || S.settings.targetR)), 0)}%` : 'بعد از بسته شدن معامله‌ها'}</div></div>
+    <div class="kpi glass flat"><div class="k">نرخ برد</div><div class="v num">${nf(st.winRate, 1)}%</div><div class="s">${!st.n ? 'بعد از بسته شدن معامله‌ها' : extra.noBE ? 'سهم معامله‌های سودده' : `سربه‌سر با هدف ${extra.R || S.settings.targetR}R: ${nf(100 / (1 + (extra.R || S.settings.targetR)), 0)}%`}</div></div>
     <div class="kpi glass flat"><div class="k">فاکتور سود</div><div class="v num ${st.profitFactor >= 1 ? 'up' : st.n ? 'down' : ''}">${pf}</div><div class="s">سود کل ÷ زیان کل</div></div>
     <div class="kpi glass flat"><div class="k">میانگین هر معامله</div><div class="v num ${cls(st.avgR)}">${signed(st.avgR, 2)}R</div><div class="s">R = ریسک هر معامله</div></div>
     <div class="kpi glass flat"><div class="k">بیشترین افت حساب</div><div class="v num down">${nf(st.maxDD, 2)}%</div><div class="s num">${nf(st.maxDDusd)} USDT</div></div>
@@ -187,7 +191,7 @@ function verdictCard(st, bench) {
   return `<div class="card glass"><div class="verdict ${kind}"><div class="badge">${icon}</div><div><b>${title}</b><p>${text}</p></div></div></div>`;
 }
 
-function breakdown(st, enabled) {
+function breakdown(st, enabled, assetsOnly = false) {
   const rows = Object.entries(STRATEGIES).filter(([k]) => !enabled || enabled.includes(k) || st.bySetup[k]).map(([k, s]) => ({ k, name: s.name, ...(st.bySetup[k] || { n: 0, wins: 0, pnl: 0 }) }));
   const max = Math.max(1, ...rows.map(r => Math.abs(r.pnl)));
   const bars = rows.map(r => {
@@ -199,9 +203,11 @@ function breakdown(st, enabled) {
       <div class="num ${cls(r.pnl)}" style="font-weight:700;min-width:70px;text-align:left">${signed(r.pnl)}</div></div>`;
   }).join('');
   const syms = Object.entries(st.bySymbol).sort((a, b) => b[1].pnl - a[1].pnl);
-  const symRows = syms.length ? syms.map(([s, v]) => `<div class="row">${coin(s, 32)}<div class="main"><div class="t1">${esc(assetBySymbol[s]?.name || s)}</div><div class="t2">${v.n} معامله · برد ${nf(v.wins / v.n * 100, 0)}%</div></div><div class="end"><div class="t1 num ${cls(v.pnl)}">${signed(v.pnl)}</div></div></div>`).join('') : '<div class="empty">هنوز معامله‌ای نیست</div>';
+  const symRows = syms.length ? syms.map(([s, v]) => `<div class="row">${coin(s, 32)}<div class="main"><div class="t1">${esc(coinName(s))}</div><div class="t2">${v.n} معامله · برد ${nf(v.wins / v.n * 100, 0)}%</div></div><div class="end"><div class="t1 num ${cls(v.pnl)}">${signed(v.pnl)}</div></div></div>`).join('') : '<div class="empty">هنوز معامله‌ای نیست</div>';
+  const assetCard = `<div class="card glass"><h3>عملکرد هر دارایی</h3><div class="list">${symRows}</div></div>`;
+  if (assetsOnly) return assetCard;
   return `<div class="card glass"><h3>عملکرد هر مهارت (ستاپ) <span class="muted">سود/زیان خالص USDT</span></h3><div class="bars">${bars}</div></div>
-    <div class="card glass"><h3>عملکرد هر دارایی</h3><div class="list">${symRows}</div></div>`;
+    ${assetCard}`;
 }
 
 function blockedCard(res) {
@@ -220,8 +226,8 @@ function tradeRow(x, live = false, res = null) {
   const side = x.dir > 0 ? '<span class="tag up">خرید</span>' : '<span class="tag down">فروش</span>';
   const reason = (live ? `<span class="tag">باز</span>` : `<span class="tag ${x.reason === 'target' ? 'up' : x.reason === 'stop' ? 'down' : ''} reason">${REASON[x.reason] || x.reason}</span>`) + (x.partialDone ? ' <span class="tag up">نیمی با سود بسته شد</span>' : '');
   return `<div class="row trade click" data-sym="${x.symbol}">${coin(x.symbol)}
-    <div class="main"><div class="t1">${esc(a?.name || x.symbol)} ${side} ${reason}</div>
-    <div class="t2">${STRATEGIES[x.setup]?.name} · <span class="num">${fp(x.entry)} → ${fp(px)}</span> · حد ضرر <span class="num">${fp(x.stop)}</span> · هدف <span class="num">${fp(x.target)}</span></div>
+    <div class="main"><div class="t1">${esc(coinName(x.symbol))} ${side} ${reason}</div>
+    <div class="t2">${setupName(x.setup)}${x.rank ? ` (رتبه‌ی ${faNum(x.rank)}، رشد ${nf(x.mom * 100, 1)}٪)` : ''} · <span class="num">${fp(x.entry)} → ${fp(px)}</span> · حد ضرر <span class="num">${fp(x.stop)}</span> · هدف <span class="num">${fp(x.target)}</span></div>
     <div class="t2">${fdt(x.entryTime)}${live ? '' : ' تا ' + fdt(x.exitTime)} · <span class="num">${nf(x.notional)}</span> USDT</div>
     ${x.ana ? `<div class="t2 ana-line"><span class="grade g${x.ana.grade}">${x.ana.grade}</span> ${esc(analysisLine(x.ana))}</div>` : ''}
     ${x.learn ? `<div class="t2 ana-line">🧠 ${esc(x.learn.why)}${x.learn.mult && x.learn.mult !== 1 ? ` · ریسک ×${x.learn.mult.toFixed(2)}` : ''}</div>` : ''}
@@ -259,8 +265,9 @@ function loadTests() {
 }
 const saveTests = () => save('tests', S.tests);
 const testById = id => S.tests.find(t => t.id === id);
-const testSymbols = t => ASSETS.map(a => a.symbol).filter(s => t.settings.symbols[s] && !unavailable.has(s));
-const testStrats = t => Object.keys(STRATEGIES).filter(k => t.settings.strategies[k] && (!t.settings.groupStrategies || Object.values(t.settings.groupStrategies).some(l => l.includes(k))));
+const isRot = t => t.kind === 'rotation';
+const testSymbols = t => (isRot(t) ? t.rot.uni : ASSETS.map(a => a.symbol).filter(s => t.settings.symbols[s] && !unavailable.has(s)));
+const testStrats = t => isRot(t) ? ['momentum'] : Object.keys(STRATEGIES).filter(k => t.settings.strategies[k] && (!t.settings.groupStrategies || Object.values(t.settings.groupStrategies).some(l => l.includes(k))));
 const testDays = t => t.settings.testDays ?? (t.end - t.start) / DAY;
 const nowBarT = () => Math.floor(Date.now() / BAR_MS) * BAR_MS;
 function focusTest() {
@@ -277,10 +284,12 @@ function sliceSeries(s, from, to) {
 let refreshing = false, lastRefreshBar = 0;
 async function refreshTests(force = false) {
   const nowBar = nowBarT();
-  const todo = S.tests.filter(t => !(S.res[t.id]?.final));
-  if (!todo.length || refreshing) return;
-  if (!force && nowBar === lastRefreshBar && todo.every(t => S.res[t.id])) return;
+  const todoAll = S.tests.filter(t => !(S.res[t.id]?.final));
+  if (!todoAll.length || refreshing) return;
+  const todo = todoAll.filter(t => !isRot(t)), rots = todoAll.filter(isRot);
+  if (!force && nowBar === lastRefreshBar && todoAll.every(t => S.res[t.id])) return;
   refreshing = true;
+  if (!todo.length) { try { for (const t of rots) await refreshRotation(t, force); } finally { refreshing = false; lastRefreshBar = nowBar; if (['dash', 'trades'].includes(S.page) && !S.detail) render(); } return; }
   // one download per asset for all tests: from the earliest start that needs it
   const need = {};
   let to = 0;
@@ -327,6 +336,7 @@ async function refreshTests(force = false) {
       save('snap:' + t.id, { at: Date.now(), stats: computeStats(res), equity: thin(res.equity, 160) });
       await new Promise(r => setTimeout(r, 0)); // keep the page responsive between tests
     }
+    for (const t of rots) await refreshRotation(t, force);
     S.liveError = '';
     lastRefreshBar = nowBar;
   } catch (e) {
@@ -336,6 +346,57 @@ async function refreshTests(force = false) {
     if (['dash', 'trades'].includes(S.page) && !S.detail) render();
   }
 }
+
+/* ---------------- momentum rotation tests (many coins, hourly) ---------------- */
+const HOUR = 3600000;
+const rotHours = new Map(); // test id -> the hour last computed
+async function refreshRotation(t, force) {
+  const nowH = Math.floor(Date.now() / HOUR) * HOUR;
+  if (!force && rotHours.get(t.id) === nowH && S.res[t.id]) return;
+  if (Date.now() < t.start) { S.res[t.id] = null; return; }
+  const to = Math.min(nowH, t.end), from = t.start - ROT_WARM_H * HOUR;
+  const series = {};
+  S.liveLoading = { done: 0, total: t.rot.uni.length }; updateLoading();
+  await pool(t.rot.uni, 4, async s => { try { series[s] = await ensureHourly(s, from, to); } catch { /* not traded any more */ } S.liveLoading.done++; updateLoading(); });
+  S.liveLoading = null;
+  if (!Object.keys(series).length) throw new Error('no data');
+  const done = Date.now() >= t.end && to >= t.end - HOUR;
+  const res = runRotation({ series, start: t.start, end: to, params: t.rot.p, capital: t.settings.capital, closeAtEnd: done });
+  if (done) { res.final = true; if (t.status !== 'done') { t.status = 'done'; saveTests(); const st = computeStats(res); toast(`«${esc(t.name)}» تمام شد: ${signed(st.pnl)} USDT`); notify('ترید لب', `${t.name} تمام شد. نتیجه: ${signed(st.pnl)} USDT`); } }
+  const B = series.BTCUSDT;
+  if (B && B.t.length) { const i0 = B.t.findIndex(x => x >= t.start); let i1 = B.t.length - 1; while (i1 > 0 && B.t[i1] >= to) i1--; res.bench = i0 >= 0 && i1 >= i0 ? (B.c[i1] / B.o[i0] - 1) * 100 : null; }
+  res.targetR = null;
+  S.res[t.id] = res; rotHours.set(t.id, nowH);
+  announce(t, res, 0);
+  save('snap:' + t.id, { at: Date.now(), stats: computeStats(res), equity: thin(res.equity, 160) });
+}
+// a new rotation test: today's 200 most traded coins, settings picked from the last 60 days
+async function startRotationTest(dr) {
+  const wrap = document.createElement('div'); wrap.className = 'modal-wrap';
+  wrap.innerHTML = `<div class="modal glass" role="dialog" aria-modal="true"><p>آماده‌سازی تست مومنتوم</p><div class="muted" id="rotMsg" style="font-size:13px;line-height:1.9;margin-top:8px"><span class="loader"></span> فهرست ۲۰۰ ارز پرحجم Binance…</div></div>`;
+  document.body.appendChild(wrap);
+  const msg = h => { const m = wrap.querySelector('#rotMsg'); if (m) m.innerHTML = `<span class="loader"></span> ${h}`; };
+  try {
+    const uni = await spotUniverse(200);
+    const start = Math.ceil(Date.now() / HOUR) * HOUR, pickFrom = start - 60 * DAY;
+    const series = {}; let n = 0;
+    await pool(uni, 4, async s => { try { series[s] = await ensureHourly(s, pickFrom - ROT_WARM_H * HOUR, start); } catch { /* */ } msg(`دریافت کندل‌های ساعتی ${faNum(++n)} از ${faNum(uni.length)}`); });
+    msg('امتحان ۲۴ ترکیب روی ۶۰ روز گذشته و انتخاب بهترین…');
+    await new Promise(r => setTimeout(r, 30));
+    const { best } = pickRotation({ series, start: pickFrom, end: start, capital: +dr.capital || 1000 });
+    const capital = Math.max(10, +dr.capital || 1000);
+    const settings = { ...deep(S.settings), capital, testDays: dr.days, pro: null, analyst: false, learn: false };
+    const t = { id: newId(), kind: 'rotation', name: (dr.name || '').trim() || `مومنتوم ${faNum(S.tests.length + 1)}`, status: 'running', start, end: start + dr.days * DAY, settings, warmup: ROT_WARM_H,
+      rot: { uni: uni.filter(s => series[s]), p: best.p, pick: { ret: best.ret, dd: best.dd, n: best.n, from: pickFrom, to: start } } };
+    S.tests.push(t); saveTests(); S.seen[t.id] = 0; save('seen2', S.seen); S.focus = t.id; S.draft = null;
+    wrap.remove();
+    toast(`«${esc(t.name)}» با ${faNum(t.rot.uni.length)} ارز شروع شد. اولین چرخش در سر ساعت بعد.`);
+    render(); refreshTests(true);
+  } catch (e) {
+    wrap.remove(); toast('دریافت داده از Binance ممکن نشد. اتصال اینترنت را بررسی کنید.');
+  }
+}
+const rotDesc = p => `رشد ${faNum(p.lookH / 24)} روزه، ${faNum(p.top)} ارز برتر، حد ضرر متحرک ${faNum(Math.round(p.trail * 100))}٪${p.btcFilter ? '، با فیلتر بیت‌کوین' : ''}`;
 
 function announce(t, res, already) {
   const ev = res.events.filter(e => e.type === 'entry' || e.type === 'exit');
@@ -347,8 +408,8 @@ function announce(t, res, already) {
   if (fresh.length > 6) { toast(`${tag}${fresh.length} رویداد جدید از آخرین بازدید`); return 1; }
   let n = 0;
   for (const e of fresh.slice(-2)) {
-    const nm = assetBySymbol[e.symbol]?.name || e.symbol;
-    if (e.type === 'entry') { const m = `ورود ${e.dir > 0 ? 'خرید' : 'فروش'} ${nm} · ${STRATEGIES[e.setup]?.name}`; toast(tag + m); notify(t.name, m); }
+    const nm = coinName(e.symbol);
+    if (e.type === 'entry') { const m = `ورود ${e.dir > 0 ? 'خرید' : 'فروش'} ${nm} · ${setupName(e.setup)}`; toast(tag + m); notify(t.name, m); }
     else { const m = `خروج ${nm} (${REASON[e.reason]}): ${signed(e.pnl)} USDT`; toast(tag + m, e.pnl >= 0 ? 'up' : 'down'); notify(t.name, m); }
     n++;
   }
@@ -385,7 +446,7 @@ const BRAINS = {
 const brainOf = st => st.learn ? 'learn' : st.analyst ? 'analyst' : 'off';
 function freshDraft() {
   const prof = activeProfile(S.settings);
-  return { name: `تست ${faNum(S.tests.length + 1)}`, capital: S.settings.capital, days: S.settings.testDays, profile: prof === 'custom' ? 'custom' : prof, strat: 'all', assets: 'all', brain: brainOf(S.settings), pro: !!S.settings.pro };
+  return { kind: 'setups', name: `تست ${faNum(S.tests.length + 1)}`, capital: S.settings.capital, days: S.settings.testDays, profile: prof === 'custom' ? 'custom' : prof, strat: 'all', assets: 'all', brain: brainOf(S.settings), pro: !!S.settings.pro };
 }
 const faNum = n => String(n).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
 function draftSettings(dr) {
@@ -407,14 +468,17 @@ function newTestForm(dr) {
   return `<div class="ntf">
     <div class="ntf-row"><label class="ntf-f"><span>نام تست</span><input class="input" id="ntName" maxlength="40" value="${esc(dr.name)}"></label>
     <label class="ntf-f"><span>بودجه (USDT)</span><input class="input num" id="ntCap" type="number" inputmode="decimal" min="10" step="10" value="${dr.capital}"></label></div>
+    <div class="pick"><div class="pick-l">نوع تست</div><div class="chips">${chips([['setups', 'ستاپ‌ها (۵۷ دارایی)'], ['rotation', 'مومنتوم ۲۰۰ ارز']], dr.kind || 'setups', 'nkind')}</div></div>
     <div class="pick"><div class="pick-l">مدت</div><div class="chips">${chips(DURATIONS.map(([d, n]) => [String(d), n]), String(dr.days), 'ndur')}</div></div>
+    ${dr.kind === 'rotation' ? `<div class="muted ntf-brain">هر روز ۲۰۰ ارز پرحجم Binance بر اساس رشد اخیر رتبه‌بندی می‌شوند؛ ربات قوی‌ترین‌ها را می‌خرد، با حد ضرر متحرک نگه می‌دارد و ضعیف‌شده‌ها را عوض می‌کند. قبل از شروع، ۲۴ ترکیب روی ۶۰ روز گذشته امتحان و بهترینش انتخاب می‌شود. کندل ساعتی اسپات، بدون نیاز به VPN.</div>
+    <div class="note warn" style="margin-top:8px;font-size:12px">در اعتبارسنجی ۴ ماه گذشته این روش هم برتری پایدار نشان نداد: ترکیبی که در ۲ ماه اول بهترین بود، در ماه بعد ۹٪ ضرر داد. این تست برای سنجیدن روی بازار زنده است.</div>` : `
     <div class="pick"><div class="pick-l">پروفایل</div><div class="chips">${chips([...Object.entries(PROFILES).map(([k, p]) => [k, p.name]), ['custom', 'طبق تنظیمات']], dr.profile, 'nprof')}</div></div>
     <div class="pick"><div class="pick-l">ستاپ‌ها</div><div class="chips">${chips(Object.entries(STRAT_SETS).map(([k, v]) => [k, v[0]]), dr.strat, 'nstrat')}</div></div>
     <div class="pick"><div class="pick-l">دارایی‌ها</div><div class="chips">${chips(Object.entries(ASSET_SETS).map(([k, v]) => [k, v[0]]), dr.assets, 'nasset')}</div></div>
     <div class="pick"><div class="pick-l">مغز ربات</div><div class="chips">${chips(Object.entries(BRAINS).map(([k, v]) => [k, v[0]]), dr.brain, 'nbrain')}</div></div>
     <div class="muted ntf-brain">${BRAINS[dr.brain][1]}</div>
     ${dr.profile === 'profit' ? '' : `<div class="pick"><div class="pick-l">میز حرفه‌ای</div><div class="chips">${chips([['on', 'روشن (۱۰ مهارت)'], ['off', 'خاموش (مثل قبل)']], dr.pro ? 'on' : 'off', 'npro')}</div></div>`}
-    <div class="muted ntf-sum">${draftSummary(dr)}</div>
+    <div class="muted ntf-sum">${draftSummary(dr)}</div>`}
   </div>`;
 }
 function draftSummary(dr) {
@@ -425,6 +489,7 @@ function draftSummary(dr) {
 function bindNewTestForm(root, dr, rerender) {
   root.querySelector('#ntName').oninput = e => { dr.name = e.target.value; };
   root.querySelector('#ntCap').oninput = e => { dr.capital = Math.max(10, +e.target.value || 1000); const s = root.querySelector('.ntf-sum'); if (s) s.innerHTML = draftSummary(dr); };
+  root.querySelectorAll('[data-nkind]').forEach(b => b.onclick = () => { dr.kind = b.dataset.nkind; if (dr.kind === 'rotation' && /^تست /.test(dr.name)) dr.name = `مومنتوم ${faNum(S.tests.length + 1)}`; rerender(); });
   root.querySelectorAll('[data-ndur]').forEach(b => b.onclick = () => { dr.days = +b.dataset.ndur; rerender(); });
   root.querySelectorAll('[data-nprof]').forEach(b => b.onclick = () => { dr.profile = b.dataset.nprof; rerender(); });
   root.querySelectorAll('[data-nstrat]').forEach(b => b.onclick = () => { dr.strat = b.dataset.nstrat; rerender(); });
@@ -433,6 +498,7 @@ function bindNewTestForm(root, dr, rerender) {
   root.querySelectorAll('[data-npro]').forEach(b => b.onclick = () => { dr.pro = b.dataset.npro === 'on'; rerender(); });
 }
 function startTest(dr) {
+  if (dr.kind === 'rotation') return startRotationTest(dr);
   const settings = draftSettings(dr);
   if (!Object.values(settings.strategies).some(Boolean)) return toast('هیچ ستاپی انتخاب نشده');
   if (!Object.values(settings.symbols).some(Boolean)) return toast('هیچ دارایی‌ای انتخاب نشده');
@@ -543,7 +609,9 @@ function settingsFromDiff(d, legacy) {
 const b64u = str => btoa(unescape(encodeURIComponent(str))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const unb64u = str => decodeURIComponent(escape(atob(str.replace(/-/g, '+').replace(/_/g, '/'))));
 function syncLink() {
-  const payload = { v: 2, m: mode.demo ? 1 : 0, t: S.tests.map(t => ({ n: t.name, s: t.start, e: t.end, w: t.warmup || 200, d: settingsDiff(t.settings) })) };
+  const payload = { v: 2, m: mode.demo ? 1 : 0, t: S.tests.map(t => isRot(t)
+    ? { n: t.name, s: t.start, e: t.end, k: 'r', c: t.settings.capital, r: { u: t.rot.uni.map(x => x.replace(/USDT$/, '')).join(','), p: t.rot.p, k: t.rot.pick } }
+    : { n: t.name, s: t.start, e: t.end, w: t.warmup || 200, d: settingsDiff(t.settings) }) };
   return location.origin + location.pathname + '#join=' + b64u(JSON.stringify(payload));
 }
 async function handleJoin() {
@@ -559,7 +627,11 @@ async function handleJoin() {
   for (const x of list) {
     if (!x || !x.s || !x.e) continue;
     if (S.tests.some(t => t.start === x.s && t.end === x.e && t.name === x.n)) continue;
-    const t = { id: newId(), name: x.n || `تست ${faNum(S.tests.length + 1)}`, status: Date.now() >= x.e ? 'done' : 'running', start: x.s, end: x.e, settings: settingsFromDiff(x.d, x.legacy), warmup: x.w || 200 };
+    const t = x.k === 'r'
+      ? { id: newId(), kind: 'rotation', name: x.n || `مومنتوم ${faNum(S.tests.length + 1)}`, status: Date.now() >= x.e ? 'done' : 'running', start: x.s, end: x.e, warmup: ROT_WARM_H,
+          settings: { ...deep(DEFAULT_SETTINGS), capital: x.c || 1000, testDays: (x.e - x.s) / DAY, pro: null, analyst: false, learn: false },
+          rot: { uni: x.r.u.split(',').map(z => z + 'USDT'), p: x.r.p, pick: x.r.k } }
+      : { id: newId(), name: x.n || `تست ${faNum(S.tests.length + 1)}`, status: Date.now() >= x.e ? 'done' : 'running', start: x.s, end: x.e, settings: settingsFromDiff(x.d, x.legacy), warmup: x.w || 200 };
     S.tests.push(t); S.seen[t.id] = 0; added++;
   }
   saveTests(); save('seen2', S.seen);
@@ -593,7 +665,7 @@ async function showSync() {
   document.body.appendChild(wrap);
   try {
     const qrcode = await loadQR();
-    const q = qrcode(0, 'M'); q.addData(link); q.make();
+    const q = qrcode(0, 'L'); q.addData(link); q.make();
     wrap.querySelector('#qrBox').innerHTML = q.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
   } catch { wrap.querySelector('#qrBox').innerHTML = '<div class="muted" style="font-size:12px">کد QR بارگذاری نشد؛ از لینک استفاده کنید.</div>'; }
 }
@@ -683,7 +755,7 @@ function testCard(t) {
   const eq = res ? thin(res.equity, 120) : snap?.equity;
   return `<div class="card glass test-card click" data-test="${t.id}">
     <div class="tc-head"><b>${esc(t.name)}</b>${statusTag(t)}</div>
-    <div class="tc-meta">${durLabel(testDays(t))} · ${profName(t.settings)} · ${testStrats(t).length} ستاپ · ${testSymbols(t).length} دارایی${t.settings.learn ? ' · <span class="tag brain">🧠 خودآموز</span>' : t.settings.analyst ? ' · <span class="tag brain">تحلیل‌گر</span>' : ''}${t.settings.pro ? ` · <span class="tag brain">حرفه‌ای · ${faNum(t.settings.pro.tf)}د</span>` : ''}</div>
+    <div class="tc-meta">${isRot(t) ? `${durLabel(testDays(t))} · <span class="tag brain">مومنتوم ${faNum(t.rot.uni.length)} ارز</span> · ${rotDesc(t.rot.p)}` : `${durLabel(testDays(t))} · ${profName(t.settings)} · ${testStrats(t).length} ستاپ · ${testSymbols(t).length} دارایی`}${isRot(t) ? '' : t.settings.learn ? ' · <span class="tag brain">🧠 خودآموز</span>' : t.settings.analyst ? ' · <span class="tag brain">تحلیل‌گر</span>' : ''}${!isRot(t) && t.settings.pro ? ` · <span class="tag brain">حرفه‌ای · ${faNum(t.settings.pro.tf)}د</span>` : ''}</div>
     <div class="tc-eq num" data-teq="${t.id}">${st ? nf(st.equity) : '<span class="skeleton">1,000.00</span>'}<small>USDT</small></div>
     <div class="pnl-row" data-tpnl="${t.id}">${st ? pnlPills(st, cap) : ''}</div>
     ${miniSpark(eq, cap)}
@@ -705,7 +777,7 @@ function compareCard() {
   const bars = rows.sort((a, b) => (b.ret ?? -1e9) - (a.ret ?? -1e9)).map(({ t, ret, st }) => {
     const w = Math.abs(ret || 0) / max * 50;
     const side = (ret || 0) >= 0 ? `left:${50 - w}%;right:50%` : `right:${50 - w}%;left:50%`;
-    return `<div class="bar-row click" data-test="${t.id}"><div><b style="font-weight:600">${esc(t.name)}</b><div class="muted" style="font-size:11.5px">${durLabel(testDays(t))} · ${profName(t.settings)} · ${st ? st.n : 0} معامله</div></div>
+    return `<div class="bar-row click" data-test="${t.id}"><div><b style="font-weight:600">${esc(t.name)}</b><div class="muted" style="font-size:11.5px">${durLabel(testDays(t))} · ${isRot(t) ? 'مومنتوم' : profName(t.settings)} · ${st ? st.n : 0} معامله</div></div>
       <div class="bar-track"><span class="mid"></span>${ret == null ? '' : `<div style="${side};background:var(--${ret >= 0 ? 'up' : 'down'})"></div>`}</div>
       <div class="num ${cls(ret)}" style="font-weight:700;min-width:70px;text-align:left">${ret == null ? '—' : signed(ret) + '%'}</div></div>`;
   }).join('');
@@ -800,18 +872,18 @@ function pageTest(main, t) {
         </div>
       </div>
       ${st ? verdictCard(st, res?.bench, L.settings.targetR) : `<div class="card glass"><div class="empty">${now < t.start ? 'تست از کندل ۵ دقیقه‌ای بعدی شروع می‌شود…' : '<span class="loader"></span><br>در حال ساخت نتیجه از کندل‌های بازار…'}</div></div>`}
-      <div class="span-2">${st ? kpiTiles(st, { k: 'سیگنال اسکنر', v: res?.signals ?? '—', s: `${durLabel(testDays(t))} · ${profName(L.settings)}`, R: L.settings.targetR }) : ''}</div>
-      <div class="card glass span-2"><h3>تنظیمات این تست</h3><div class="tc-cfg">
+      <div class="span-2">${st ? kpiTiles(st, isRot(t) ? { k: 'چرخش‌ها', v: res?.rebalances ?? '—', s: res?.marketOff ? `${faNum(res.marketOff)} بار در نقد ماند (بیت‌کوین نزولی)` : 'رتبه‌بندی روزانه', noBE: true } : { k: 'سیگنال اسکنر', v: res?.signals ?? '—', s: `${durLabel(testDays(t))} · ${profName(L.settings)}`, R: L.settings.targetR }) : ''}</div>
+      ${isRot(t) ? rotConfigCard(t, res) : `<div class="card glass span-2"><h3>تنظیمات این تست</h3><div class="tc-cfg">
         <span>پروفایل: <b>${profName(L.settings)}</b></span><span>ریسک هر معامله: <b class="num">${L.settings.riskPct}%</b></span><span>هدف: <b class="num">${L.settings.targetR}R</b></span><span>نگه‌داری: <b class="num">${L.settings.maxHoldHours}</b> ساعت</span><span>پوزیشن هم‌زمان: <b class="num">${L.settings.maxOpen}</b></span><span>شورت: <b>${L.settings.pro ? (L.settings.pro.shorts ? 'روی فیوچرز' : 'خاموش') : L.settings.allowShort ? 'روشن' : 'خاموش'}</b></span><span>مغز ربات: <b>${BRAINS[brainOf(L.settings)][0]}</b></span><span>میز حرفه‌ای: <b>${L.settings.pro ? `روشن، کندل ${faNum(L.settings.pro.tf)} دقیقه‌ای` : 'خاموش'}</b></span></div>
         ${L.settings.pro ? `<div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.9">${proLines(L.settings.pro).join(' · ')}</div>` : ''}
-        <div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.9">${L.settings.groupStrategies ? Object.entries(GROUPS).map(([g, gn]) => `ستاپ‌های ${gn}: ${(L.settings.groupStrategies[g] || []).filter(k => L.settings.strategies[k]).map(k => STRATEGIES[k].name).join('، ') || 'هیچ (این گروه معامله نمی‌شود)'}`).join('<br>') : `ستاپ‌ها: ${enabled.map(k => STRATEGIES[k].name).join('، ')}`}<br>${L.settings.maxCostR ? `سقف کارمزد: ${nf(L.settings.maxCostR * 100, 0)}٪ ریسک<br>` : ''}دارایی‌ها: ${testSymbols(t).map(s => assetBySymbol[s]?.short || s).join('، ')}</div></div>
+        <div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.9">${L.settings.groupStrategies ? Object.entries(GROUPS).map(([g, gn]) => `ستاپ‌های ${gn}: ${(L.settings.groupStrategies[g] || []).filter(k => L.settings.strategies[k]).map(k => STRATEGIES[k].name).join('، ') || 'هیچ (این گروه معامله نمی‌شود)'}`).join('<br>') : `ستاپ‌ها: ${enabled.map(k => STRATEGIES[k].name).join('، ')}`}<br>${L.settings.maxCostR ? `سقف کارمزد: ${nf(L.settings.maxCostR * 100, 0)}٪ ریسک<br>` : ''}دارایی‌ها: ${testSymbols(t).map(s => assetBySymbol[s]?.short || s).join('، ')}</div></div>`}
       ${res?.learn ? `<div class="span-2">${experienceCard(res)}</div>` : res?.decisions ? `<div class="span-2">${decisionsCard(res)}</div>` : ''}
       ${res && res.closed.length ? `<div class="span-2 grid cols-2">${validationCard(res, L.settings)}${postTradeCard(res)}</div>` : ''}
       ${res ? `<div class="span-2">${accuracyCard(res, enabled)}</div>` : ''}
       <div class="card glass span-2"><h3>منحنی سرمایه <span class="muted">هر نقطه = بسته شدن یک کندل ۵ دقیقه‌ای</span></h3><div class="chart-box" id="eqChart"></div></div>
       <div class="card glass"><h3>پوزیشن‌های باز <span class="muted">قیمت زنده</span></h3><div class="list" id="openList">${openList(res)}</div></div>
       <div class="card glass"><h3>آخرین معاملات <span class="muted"><a href="#trades" id="allTrades">همه</a></span></h3><div class="list">${res && res.closed.length ? res.closed.slice(-6).reverse().map(x => tradeRow(x, false, res)).join('') : '<div class="empty">هنوز معامله‌ای بسته نشده</div>'}</div></div>
-      ${st && st.n ? `<div class="span-2 grid cols-2">${breakdown(st, enabled)}</div>` : ''}
+      ${st && st.n ? `<div class="span-2 grid cols-2">${breakdown(st, isRot(t) ? null : enabled, isRot(t))}</div>` : ''}
       ${res ? `<div class="span-2">${blockedCard(res)}</div>` : ''}
     </div></div>`;
   const eq = createAreaChart($('#eqChart'), { base: L.settings.capital, emptyText: 'منحنی سرمایه بعد از اولین کندل‌ها رسم می‌شود' });
@@ -825,6 +897,13 @@ function pageTest(main, t) {
   $('#allTrades').onclick = e => { e.preventDefault(); S.tradesSrc = t.id; go('trades'); };
   main.querySelectorAll('.row[data-sym]').forEach(r => r.onclick = () => openDetail(r.dataset.sym));
   updateLoading();
+}
+function rotConfigCard(t, res) {
+  const p = t.rot.p, k = t.rot.pick;
+  const held = res?.open?.length ? res.open.map(x => coinName(x.symbol)).join('، ') : 'فعلاً هیچ (نقد)';
+  return `<div class="card glass span-2"><h3>تنظیمات این تست <span class="muted">مومنتوم ${faNum(t.rot.uni.length)} ارز</span></h3>
+    <div class="tc-cfg"><span>بازه‌ی رشد: <b>${faNum(p.lookH / 24)} روز</b></span><span>تعداد ارز هم‌زمان: <b>${faNum(p.top)}</b></span><span>چرخش: <b>هر ${faNum(p.rebH)} ساعت</b></span><span>حد ضرر متحرک: <b>${faNum(Math.round(p.trail * 100))}٪</b></span><span>فیلتر بیت‌کوین: <b>${p.btcFilter ? 'روشن' : 'خاموش'}</b></span><span>کارمزد: <b>۰.۱٪</b> + لغزش بر اساس حجم</span></div>
+    <div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.9">این تنظیمات از بین ۲۴ ترکیب، روی ۶۰ روز قبل از شروع انتخاب شد (آنجا: ${signed(k.ret, 1)}٪ با بیشترین افت ${nf(k.dd, 1)}٪ و ${faNum(k.n)} معامله). این تست نشان می‌دهد همان تنظیمات روی بازار تازه چه می‌کند.<br>الان در دست: ${esc(held)}</div></div>`;
 }
 /* the analyst's and the memory's decisions, and what the memory has learned */
 const DEC = { taken: 'معامله شد', learned: 'رد به خاطر تجربه', analyst: 'رد به خاطر تحلیل چارت', other: 'رد توسط مدیر ریسک', skipped: 'پوزیشن باز بود یا وقت گذشت', filtered: 'رد توسط فیلترها (حالت بازار، بیت‌کوین، خبر، کارمزد)' };
@@ -1007,7 +1086,7 @@ async function loadSparks() {
   if (S.page === 'market' && !S.detail) render();
 }
 
-function openDetail(sym) { S.page = 'market'; S.detail = sym; history.replaceState(null, '', '#market'); render(); window.scrollTo({ top: 0 }); }
+function openDetail(sym) { if (!assetBySymbol[sym]) return; S.page = 'market'; S.detail = sym; history.replaceState(null, '', '#market'); render(); window.scrollTo({ top: 0 }); }
 
 const TFS = [['1m', '۱ دقیقه', '۱د'], ['5m', '۵ دقیقه', '۵د'], ['15m', '۱۵ دقیقه', '۱۵د'], ['1h', '۱ ساعت', '۱س'], ['4h', '۴ ساعت', '۴س'], ['1d', 'روزانه', 'روز']];
 let detailTimer = null;
