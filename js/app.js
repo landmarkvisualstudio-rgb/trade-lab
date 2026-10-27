@@ -1,6 +1,6 @@
 import { ASSETS, GROUPS, STRATEGIES, FAMILIES, DEFAULT_SETTINGS, BAR_MS, WARMUP_BARS, OPTIMIZED, PRO_DEFAULTS, assetBySymbol } from './config.js';
 import { runSimulation, closeAllAtEnd, computeStats, signalStats, BLOCK_REASONS } from './engine.js';
-import { ensureHistory, ensureDeriv, klines, tickers, liveStream, pool, unavailable, netState, toSeries, mode, probe } from './data.js';
+import { ensureHistory, ensureDeriv, klines, tickers, liveStream, pool, unavailable, stale, netState, toSeries, mode, probe } from './data.js';
 import { confidence, walkForward, wfWarmupBars } from './validate.js';
 import { REGIME_NAMES } from './regime.js';
 import { SESSION_NAMES } from './calendar.js';
@@ -625,7 +625,17 @@ function accuracyCard(res, enabled) {
 
 /* ---------------- offline / demo ---------------- */
 function setDemo(on) { save('demo', on); location.reload(); }
+function staleNote() {
+  if (!stale.size) return '';
+  const fut = [...stale.keys()].filter(s => assetBySymbol[s]?.market === 'futures').length;
+  const oldest = Math.min(...stale.values());
+  return `<div class="note warn" style="margin-bottom:14px"><b>${faNum(stale.size)} دارایی به‌روز نشد</b>${fut ? ` (${faNum(fut)} تا از بازار فیوچرز)` : ''}: سرور Binance از این دستگاه در دسترس نیست. این دارایی‌ها با آخرین کندل‌های ذخیره‌شده (تا ${fdt(oldest)}) در تست می‌مانند و از آن به بعد معامله نمی‌شوند. سرور فیوچرز Binance از ایران معمولاً فقط با VPN باز می‌شود؛ با روشن شدن VPN، کندل‌های جاافتاده گرفته و همه‌ی تست‌ها دقیق بازسازی می‌شوند.</div>`;
+}
 function offlineCard() {
+  if (!mode.demo && stale.size) return staleNote() + (S.offline ? offlineCard0() : '');
+  return offlineCard0();
+}
+function offlineCard0() {
   if (mode.demo) return `<div class="note warn" style="margin-bottom:14px"><b>حالت نمایشی:</b> قیمت‌ها و کندل‌ها شبیه‌سازی‌شده‌اند، نه بازار واقعی. این حالت برای دیدن کارکرد اپ است و سود و زیانش چیزی درباره‌ی کارایی سیستم در بازار واقعی نمی‌گوید.</div>`;
   if (!S.offline) return '';
   return `<div class="card glass offline-card"><div class="txt"><b>اتصال به Binance برقرار نشد</b>

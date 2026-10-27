@@ -26,6 +26,8 @@ export async function probe() {
   try { await getJSON('spot', '/api/v3/time', {}); return true; } catch { return false; }
 }
 export const unavailable = new Set();
+// assets whose newest candles could not be fetched: symbol -> time of the last candle we have
+export const stale = new Map();
 export const netState = { ok: true, lastError: '' };
 
 class BadSymbol extends Error {}
@@ -102,14 +104,24 @@ export async function ensureHistory(symbol, from, to) {
   rows = rows.filter(r => r[0] >= keepFrom);
   if (rows.length && rows[0][0] > from + BAR_MS && rows[0][0] - from > 60 * 86400000) rows = [];
   const first = rows.length ? rows[0][0] : Infinity;
-  if (first > from + BAR_MS) {
-    const head = await klinesRange(symbol, '5m', from, rows.length ? first : to, BAR_MS);
-    rows = mergeRows(head, rows);
-  }
-  const last = rows.length ? rows[rows.length - 1][0] : from - BAR_MS;
-  if (last + 2 * BAR_MS <= to) {
-    const tail = await klinesRange(symbol, '5m', last + BAR_MS, to, BAR_MS);
-    rows = mergeRows(rows, tail);
+  try {
+    if (first > from + BAR_MS) {
+      const head = await klinesRange(symbol, '5m', from, rows.length ? first : to, BAR_MS);
+      rows = mergeRows(head, rows);
+    }
+    const last = rows.length ? rows[rows.length - 1][0] : from - BAR_MS;
+    if (last + 2 * BAR_MS <= to) {
+      const tail = await klinesRange(symbol, '5m', last + BAR_MS, to, BAR_MS);
+      rows = mergeRows(rows, tail);
+    }
+    stale.delete(symbol);
+  } catch (e) {
+    // the server can't be reached right now (often the futures server without a VPN):
+    // keep the asset in the test with the candles already on this device, and say so
+    const have = rows.filter(r => r[0] >= from && r[0] < to);
+    if (!have.length || e instanceof BadSymbol) throw e;
+    stale.set(symbol, have[have.length - 1][0] + BAR_MS);
+    return toSeries(have);
   }
   await idbSet(key, rows);
   return toSeries(rows.filter(r => r[0] >= from && r[0] < to));
