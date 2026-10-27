@@ -53,7 +53,8 @@ export function runRotation({ series, start, end, params = {}, capital = 1000, f
     pos.delete(s);
   };
 
-  for (let t = Math.ceil(start / H) * H; t < end; t += H) {
+  const first = Math.ceil(start / H) * H;
+  for (let t = first; t < end; t += H) {
     // 1) trailing stops on the bar that opens at t (stop first, at the stop or the gap)
     for (const [s, p] of [...pos]) {
       const i = idx[s].get(t); if (i === undefined) continue;
@@ -64,7 +65,8 @@ export function runRotation({ series, start, end, params = {}, capital = 1000, f
       else { p.high = Math.max(p.high, S.h[i]); p.last = S.c[i]; }
     }
     // 2) rebalance, using bars closed before t, filled at the open of the bar at t
-    if (t % (P.rebH * H) === 0) {
+    // (also on the very first hour, so a new test starts trading right away)
+    if (t === first || t % (P.rebH * H) === 0) {
       rebalances++;
       let marketOk = true;
       if (P.btcFilter && btc) { const bi = bIdx.get(t - H); marketOk = bi !== undefined && btc.c[bi] > bSma[bi]; }
